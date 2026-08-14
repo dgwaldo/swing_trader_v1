@@ -1,0 +1,31 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated scan snapshots
+/data/scans/*.json
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build and distribution artifacts
+build/
+dist/
+*.egg-info/
