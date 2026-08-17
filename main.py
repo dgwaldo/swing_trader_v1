@@ -87,12 +87,35 @@ def scan(symbols=None, output_path=None, top=15):
     print_candidates_table(candidates)
 
 
+def historical_fit(result):
+    if result.trades < 10:
+        return "Limited data"
+    if result.total_return > 0 and result.max_drawdown <= 5:
+        return "Strong"
+    return "Weak"
+
+
+def print_backtest_table(results):
+    print("\n## Backtest Results\n")
+    print("| Symbol | Trades | Wins | Losses | Win Rate | Total Return | Max Drawdown | Historical Fit |")
+    print("|---|---:|---:|---:|---:|---:|---:|---|")
+
+    for result in results:
+        print(
+            f"| {result.symbol} | {result.trades} | {result.wins} | "
+            f"{result.losses} | {result.win_rate:.1f}% | "
+            f"{result.total_return:+.2f}% | {result.max_drawdown:.2f}% | "
+            f"{historical_fit(result)} |"
+        )
+
+
 def backtest(symbols):
     cfg = TradingConfig()
     if isinstance(symbols, str):
         symbols = [symbols]
 
     print(f"\n=== BACKTEST ({len(symbols)} SYMBOLS) ===")
+    results = []
     for symbol in symbols:
         print(f"\nDownloading {symbol}...")
         try:
@@ -102,13 +125,15 @@ def backtest(symbols):
             print(f"  ERROR: {exc}")
             continue
 
-        print(f"Symbol:       {result.symbol}")
-        print(f"Trades:       {result.trades}")
-        print(f"Wins:         {result.wins}")
-        print(f"Losses:       {result.losses}")
-        print(f"Win rate:     {result.win_rate:.1f}%")
-        print(f"Total return: {result.total_return:.2f}%")
-        print(f"Max drawdown: {result.max_drawdown:.2f}%")
+        results.append(result)
+
+    if not results:
+        print("No backtest results were produced.")
+        return
+
+    fit_rank = {"Strong": 0, "Limited data": 1, "Weak": 2}
+    results.sort(key=lambda result: (fit_rank[historical_fit(result)], -result.total_return))
+    print_backtest_table(results)
 
 
 if __name__ == "__main__":
