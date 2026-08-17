@@ -16,6 +16,44 @@ class BacktestResult:
     max_drawdown: float
 
 
+def _entry_signal(row, cfg: TradingConfig) -> bool:
+    """Mirrors the live scanner: full trend stack, momentum, volume, liquidity."""
+    return (
+        row["Close"] >= cfg.minimum_price
+        and row["AVG_VOLUME20"] >= cfg.minimum_average_volume
+        and row["Close"] > row["SMA20"]
+        and row["SMA20"] > row["SMA50"]
+        and row["SMA50"] > row["SMA200"]
+        and 50 <= row["RSI"] <= 70
+        and row["MACD"] > row["MACD_SIGNAL"]
+        and row["VOLUME_RATIO"] >= 1.0
+    )
+
+
+def _position_size(cash: float, entry: float, risk_per_share: float, cfg: TradingConfig) -> int:
+    return int(min(
+        (cash * cfg.risk_fraction) / risk_per_share,
+        (cash * cfg.max_position_fraction) / entry,
+    ))
+
+
+def _simulate_exit(df: pd.DataFrame, i: int, stop: float, target: float) -> tuple[float, int]:
+    """Walks forward up to 10 sessions; a stop/low touch is assumed to fill before a target/high touch."""
+    end = min(i + 11, len(df))
+
+    for j in range(i + 1, end):
+        bar = df.iloc[j]
+
+        if bar["Low"] <= stop:
+            return stop, j
+
+        if bar["High"] >= target:
+            return target, j
+
+    exit_index = end - 1
+    return float(df.iloc[exit_index]["Close"]), exit_index
+
+
 def run(symbol: str, raw: pd.DataFrame, cfg: TradingConfig) -> BacktestResult:
     df = add_indicators(raw).dropna().copy()
 
@@ -25,22 +63,14 @@ def run(symbol: str, raw: pd.DataFrame, cfg: TradingConfig) -> BacktestResult:
     wins = 0
     losses = 0
 
-    for i in range(1, len(df) - 1):
+    i = 1
+    while i < len(df) - 1:
         today = df.iloc[i]
         tomorrow = df.iloc[i + 1]
 
-        # Conservative entry signal: trend + momentum + volume.
-        signal = (
-            today["Close"] > today["SMA20"]
-            and today["SMA20"] > today["SMA50"]
-            and today["RSI"] >= 50
-            and today["RSI"] <= 70
-            and today["MACD"] > today["MACD_SIGNAL"]
-            and today["VOLUME_RATIO"] >= 1.0
-        )
-
-        if not signal:
+        if not _entry_signal(today, cfg):
             equity_curve.append(cash)
+            i += 1
             continue
 
         entry = float(tomorrow["Open"])
@@ -49,37 +79,18 @@ def run(symbol: str, raw: pd.DataFrame, cfg: TradingConfig) -> BacktestResult:
 
         if risk_per_share <= 0:
             equity_curve.append(cash)
+            i += 1
             continue
 
-        shares = int(min(
-            (cash * cfg.risk_fraction) / risk_per_share,
-            (cash * cfg.max_position_fraction) / entry,
-        ))
+        shares = _position_size(cash, entry, risk_per_share, cfg)
 
         if shares < 1:
             equity_curve.append(cash)
+            i += 1
             continue
 
         target = entry + risk_per_share * cfg.target_rr
-
-        # V1 holds for up to 10 trading sessions.
-        exit_price = None
-        end = min(i + 11, len(df))
-
-        for j in range(i + 1, end):
-            bar = df.iloc[j]
-
-            # If both are hit in one candle, assume stop first.
-            if bar["Low"] <= stop:
-                exit_price = stop
-                break
-
-            if bar["High"] >= target:
-                exit_price = target
-                break
-
-        if exit_price is None:
-            exit_price = float(df.iloc[end - 1]["Close"])
+        exit_price, exit_index = _simulate_exit(df, i, stop, target)
 
         pnl = (exit_price - entry) * shares
         cash += pnl
@@ -90,7 +101,9 @@ def run(symbol: str, raw: pd.DataFrame, cfg: TradingConfig) -> BacktestResult:
         else:
             losses += 1
 
-        equity_curve.append(cash)
+        # Hold cash flat until the position closes so trades never overlap.
+        equity_curve.extend([cash] * (exit_index - i + 1))
+        i = exit_index + 1
 
     if not equity_curve:
         equity_curve = [cash]

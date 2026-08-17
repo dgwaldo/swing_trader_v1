@@ -33,7 +33,26 @@ def save_scan(candidates, symbols, output_path):
     print(f"Saved scan snapshot to {path}")
 
 
-def scan(symbols=None, output_path=None):
+def print_candidates_table(candidates):
+    print("\n## Swing Trade Candidates\n")
+    print(
+        "| Symbol | Score | Setup | Entry | Stop | Target | Shares | Risk | R:R | "
+        "Sentiment | Reasons |"
+    )
+    print("|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---|")
+
+    for candidate in candidates:
+        reasons = "; ".join(candidate.reasons)
+        print(
+            f"| {candidate.symbol} | {candidate.score} | {candidate.setup} | "
+            f"${candidate.entry:.2f} | ${candidate.stop:.2f} | "
+            f"${candidate.target:.2f} | {candidate.shares} | "
+            f"${candidate.risk_dollars:.2f} | {candidate.reward_risk:.1f} | "
+            f"{candidate.sentiment_score:+.2f} | {reasons} |"
+        )
+
+
+def scan(symbols=None, output_path=None, top=15):
     cfg = TradingConfig()
     if not symbols:
         symbols = discover_symbols(
@@ -55,23 +74,17 @@ def scan(symbols=None, output_path=None):
             print(f"  ERROR: {exc}")
 
     candidates.sort(key=lambda x: (x.score, x.reward_risk), reverse=True)
+    if top:
+        candidates = candidates[:top]
     if output_path is None:
         output_path = Path("data") / "scans" / f"scan_{date.today().isoformat()}.json"
     save_scan(candidates, symbols, output_path)
 
-    print("\n=== SWING TRADE CANDIDATES ===")
     if not candidates:
         print("No candidates met the V1 criteria.")
         return
 
-    for c in candidates:
-        print(
-            f"{c.symbol:5} | score {c.score:3} | {c.setup:8} | "
-            f"entry ${c.entry:8.2f} | stop ${c.stop:8.2f} | "
-            f"target ${c.target:8.2f} | shares {c.shares:2} | "
-            f"risk ${c.risk_dollars:5.2f} | R:R {c.reward_risk:.1f}"
-        )
-        print("       " + ", ".join(c.reasons))
+    print_candidates_table(candidates)
 
 
 def backtest(symbols):
@@ -105,6 +118,7 @@ if __name__ == "__main__":
     scan_parser = sub.add_parser("scan")
     scan_parser.add_argument("--symbols", nargs="+")
     scan_parser.add_argument("--output", help="Path for the JSON scan snapshot")
+    scan_parser.add_argument("--top", type=int, default=15, help="Max candidates to keep (0 = no limit)")
 
     bt_parser = sub.add_parser("backtest")
     bt_symbols = bt_parser.add_mutually_exclusive_group(required=True)
@@ -114,6 +128,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.command == "scan":
-        scan(args.symbols, args.output)
+        scan(args.symbols, args.output, args.top)
     elif args.command == "backtest":
         backtest(args.symbols or args.symbol)

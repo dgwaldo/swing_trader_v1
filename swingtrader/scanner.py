@@ -4,6 +4,7 @@ import pandas as pd
 
 from .config import TradingConfig
 from .indicators import add_indicators
+from .sentiment import get_sentiment
 
 
 @dataclass
@@ -18,6 +19,8 @@ class TradeCandidate:
     risk_dollars: float
     reward_risk: float
     reasons: list[str]
+    sentiment_score: float = 0.0
+    sentiment_headline: str | None = None
 
 
 def analyze(symbol: str, raw: pd.DataFrame, cfg: TradingConfig) -> TradeCandidate | None:
@@ -83,6 +86,15 @@ def analyze(symbol: str, raw: pd.DataFrame, cfg: TradingConfig) -> TradeCandidat
     if score < 60:
         return None
 
+    sentiment = get_sentiment(symbol)
+    if sentiment.article_count:
+        if sentiment.score >= cfg.sentiment_positive_threshold:
+            score += cfg.sentiment_bonus_score
+            reasons.append("positive news sentiment")
+        elif sentiment.score <= cfg.sentiment_negative_threshold:
+            score -= cfg.sentiment_penalty_score
+            reasons.append("negative news sentiment")
+
     entry = price
     stop = entry - (atr * cfg.stop_atr_multiple)
 
@@ -116,4 +128,6 @@ def analyze(symbol: str, raw: pd.DataFrame, cfg: TradingConfig) -> TradeCandidat
         risk_dollars=risk_dollars,
         reward_risk=rr,
         reasons=reasons,
+        sentiment_score=sentiment.score,
+        sentiment_headline=sentiment.headline,
     )

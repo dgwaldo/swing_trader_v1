@@ -11,3 +11,7 @@ class TradingConfig:
     target_rr: float = 2.5
     minimum_price: float = 10.0
     minimum_average_volume: int = 500_000
+    sentiment_positive_threshold: float = 0.2
+    sentiment_negative_threshold: float = -0.2
+    sentiment_bonus_score: int = 5
+    sentiment_penalty_score: int = 10
