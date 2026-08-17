@@ -72,6 +72,22 @@ python main.py backtest --symbols AAPL MSFT NVDA AMD TSLA
 Each symbol gets its own result starting from the configured account size; this is
 not yet a combined portfolio backtest.
 
+Multi-symbol backtests print a Markdown comparison table with trades, wins, losses,
+win rate, total return, maximum drawdown, and historical fit. Results are sorted by
+historical fit first, then by total return.
+
+`Historical Fit` is a quick review label, not a prediction or a trade signal:
+
+| Historical Fit | Criteria |
+|---|---|
+| Strong | At least 10 trades, positive total return, and maximum drawdown at or below 5% |
+| Limited data | Fewer than 10 trades |
+| Weak | At least 10 trades with a negative return or drawdown above 5% |
+
+Use a positive historical fit alongside a valid current scan, not instead of one.
+Small samples can look impressive by chance, and a strong past result does not
+guarantee a future trade will work.
+
 You can also scan a custom list:
 
 ```powershell
