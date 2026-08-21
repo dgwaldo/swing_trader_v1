@@ -56,3 +56,22 @@ def download(symbol: str, period: str = "2y") -> pd.DataFrame:
         df.columns = df.columns.get_level_values(0)
 
     return df.dropna()
+
+
+def current_price(symbol: str) -> float | None:
+    """Return the latest regular or extended-hours price when available."""
+    try:
+        history = yf.Ticker(symbol).history(
+            period="1d",
+            interval="1m",
+            prepost=True,
+            auto_adjust=True,
+        )
+    except Exception:
+        return None
+
+    if history.empty:
+        return None
+
+    close = history["Close"].dropna()
+    return float(close.iloc[-1]) if not close.empty else None

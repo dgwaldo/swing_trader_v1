@@ -23,7 +23,12 @@ class TradeCandidate:
     sentiment_headline: str | None = None
 
 
-def analyze(symbol: str, raw: pd.DataFrame, cfg: TradingConfig) -> TradeCandidate | None:
+def analyze(
+    symbol: str,
+    raw: pd.DataFrame,
+    cfg: TradingConfig,
+    current_price: float | None = None,
+) -> TradeCandidate | None:
     if raw.empty:
         return None
 
@@ -95,7 +100,7 @@ def analyze(symbol: str, raw: pd.DataFrame, cfg: TradingConfig) -> TradeCandidat
             score -= cfg.sentiment_penalty_score
             reasons.append("negative news sentiment")
 
-    entry = price
+    entry = current_price if current_price is not None else price
     stop = entry - (atr * cfg.stop_atr_multiple)
 
     if stop <= 0 or stop >= entry:

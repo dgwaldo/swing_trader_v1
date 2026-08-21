@@ -55,6 +55,35 @@ python main.py scan --top 10
 python main.py scan --top 0
 ```
 
+## Run evening workflow
+
+For an after-hours next-day plan, scan the market, backtest the top 10 qualifying
+candidates, and print a combined grid in one command:
+
+```powershell
+python main.py evening
+```
+
+The workflow uses the current live or extended-hours price for the planned entry,
+then recalculates the stop, target, shares, and planned risk. It uses five years of
+historical daily data for each selected candidate's backtest. The combined report
+is saved under `data/scans/evening_YYYY-MM-DD.json`. You can scan a specific list or
+choose another report path:
+
+```powershell
+python main.py evening --symbols AAPL MSFT NVDA AMD TSLA
+python main.py evening --output data/scans/my-evening-report.json
+```
+
+The evening grid is a decision aid for the following session, not an automatic order
+system. Before placing an order, recheck the live bid/ask, spread, liquidity, and
+any overnight news. A backtest result is historical context, not a prediction.
+
+The evening command also prints a rules-based English `Buying Focus` brief beneath
+the grid. It highlights up to three names that combine a strong current scan with a
+Strong historical fit, then separates secondary watchlist names and cautions. This
+is explainable local analysis, not a cloud AI model or financial advice.
+
 Generated scan snapshots are ignored by Git because they are daily runtime output.
 
 ## Run backtest
