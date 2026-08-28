@@ -4,6 +4,7 @@ import yfinance as yf
 
 def discover_symbols(
     minimum_price: float = 10.0,
+    maximum_price: float = 400.0,
     minimum_volume: int = 500_000,
     size: int = 100,
 ) -> list[str]:
@@ -30,6 +31,8 @@ def discover_symbols(
             if not symbol:
                 continue
             if price is not None and price < minimum_price:
+                continue
+            if price is not None and price > maximum_price:
                 continue
             if volume is not None and volume < minimum_volume:
                 continue

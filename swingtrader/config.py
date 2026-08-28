@@ -16,7 +16,9 @@ class TradingConfig:
     # Profit target distance, expressed as a multiple of the planned risk.
     target_rr: float = 2.5
     # Avoid low-priced stocks that can have large percentage swings and wide spreads.
-    minimum_price: float = 10.0
+    minimum_price: float = 5.0
+    # Avoid stocks above the largest whole-share position this account can take by default.
+    maximum_price: float = 25.0
     # Require this many shares traded per day on average over the last 20 days.
     minimum_average_volume: int = 500_000
     # Average headline sentiment at or above this value earns a small score bonus.

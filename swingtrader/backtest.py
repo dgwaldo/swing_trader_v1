@@ -20,6 +20,7 @@ def _entry_signal(row, cfg: TradingConfig) -> bool:
     """Mirrors the live scanner: full trend stack, momentum, volume, liquidity."""
     return (
         row["Close"] >= cfg.minimum_price
+        and row["Close"] <= cfg.maximum_price
         and row["AVG_VOLUME20"] >= cfg.minimum_average_volume
         and row["Close"] > row["SMA20"]
         and row["SMA20"] > row["SMA50"]

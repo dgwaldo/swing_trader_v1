@@ -35,8 +35,8 @@ python main.py scan
 With no symbol list, the scanner discovers liquid current movers from Yahoo Finance
 using the day-gainers and most-active screens, then applies the normal V1 technical
 rules to each symbol. If Yahoo's screener is unavailable, it falls back to the
-curated fallback list in `main.py`. Discovery filters out symbols below $10 or
-500,000 current volume before the technical scan runs.
+curated fallback list in `main.py`. Discovery filters out symbols below $10,
+above $400, or below 500,000 current volume before the technical scan runs.
 
 Each scan also saves a structured JSON snapshot under `data/scans/`, including the
 scan date, symbols checked, and ranked candidates. Use `--output` to choose a
@@ -53,6 +53,12 @@ The scanner keeps the top 15 candidates by default. Choose another limit with
 ```powershell
 python main.py scan --top 10
 python main.py scan --top 0
+```
+
+Target a custom stock price range with `--min-price` and `--max-price`:
+
+```powershell
+python main.py scan --min-price 5 --max-price 25
 ```
 
 ## Run evening workflow
@@ -73,6 +79,7 @@ choose another report path:
 ```powershell
 python main.py evening --symbols AAPL MSFT NVDA AMD TSLA
 python main.py evening --output data/scans/my-evening-report.json
+python main.py evening --min-price 5 --max-price 25
 ```
 
 The evening grid is a decision aid for the following session, not an automatic order
@@ -80,9 +87,13 @@ system. Before placing an order, recheck the live bid/ask, spread, liquidity, an
 any overnight news. A backtest result is historical context, not a prediction.
 
 The evening command also prints a rules-based English `Buying Focus` brief beneath
-the grid. It highlights up to three names that combine a strong current scan with a
-Strong historical fit, then separates secondary watchlist names and cautions. This
-is explainable local analysis, not a cloud AI model or financial advice.
+the grid. The grid and the brief use the same overall ranking, so Rank 1 is the best
+overall current opportunity, Rank 2 is the second best, and so on. Ranking starts
+with the live setup score, then uses historical fit, backtest return, win rate,
+drawdown, and trade count to break ties. The `Strong`, `Limited data`, and `Weak`
+labels remain visible as historical-context warnings; a high live rank with limited
+backtest data should still be treated cautiously. This is explainable local
+analysis, not a cloud AI model or financial advice.
 
 Generated scan snapshots are ignored by Git because they are daily runtime output.
 
@@ -138,6 +149,7 @@ liquidity, or your risk rules.
 
 - Account size: $1,000
 - Risk per trade: 1% ($10)
+- Stock price range: $10 to $400
 - Minimum reward/risk: 2:1
 - Maximum position value: 40% of account
 - Long-only

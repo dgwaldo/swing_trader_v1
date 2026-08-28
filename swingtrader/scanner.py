@@ -39,10 +39,15 @@ def analyze(
     r = df.iloc[-1]
 
     price = float(r["Close"])
+    entry = current_price if current_price is not None else price
     atr = float(r["ATR"])
     avg_volume = float(r["AVG_VOLUME20"])
 
-    if price < cfg.minimum_price or avg_volume < cfg.minimum_average_volume:
+    if (
+        entry < cfg.minimum_price
+        or entry > cfg.maximum_price
+        or avg_volume < cfg.minimum_average_volume
+    ):
         return None
 
     score = 0
@@ -100,7 +105,6 @@ def analyze(
             score -= cfg.sentiment_penalty_score
             reasons.append("negative news sentiment")
 
-    entry = current_price if current_price is not None else price
     stop = entry - (atr * cfg.stop_atr_multiple)
 
     if stop <= 0 or stop >= entry:
