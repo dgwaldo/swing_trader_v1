@@ -61,6 +61,13 @@ Target a custom stock price range with `--min-price` and `--max-price`:
 python main.py scan --min-price 5 --max-price 25
 ```
 
+The evening grid reports a target percent move above the planned entry. It defaults
+to 1%; change it with `--move-percent`:
+
+```powershell
+python main.py scan --move-percent 2.5
+```
+
 ## Run evening workflow
 
 For an after-hours next-day plan, scan the market, backtest the top 10 qualifying
@@ -80,6 +87,7 @@ choose another report path:
 python main.py evening --symbols AAPL MSFT NVDA AMD TSLA
 python main.py evening --output data/scans/my-evening-report.json
 python main.py evening --min-price 5 --max-price 25
+python main.py evening --move-percent 2.5
 ```
 
 The evening grid is a decision aid for the following session, not an automatic order
@@ -149,7 +157,7 @@ liquidity, or your risk rules.
 
 - Account size: $1,000
 - Risk per trade: 1% ($10)
-- Stock price range: $10 to $400
+- Stock price range: $5 to $25
 - Minimum reward/risk: 2:1
 - Maximum position value: 40% of account
 - Long-only

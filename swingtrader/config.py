@@ -29,3 +29,5 @@ class TradingConfig:
     sentiment_bonus_score: int = 5
     # Points subtracted from an otherwise valid setup with clearly negative headline sentiment.
     sentiment_penalty_score: int = 10
+    # Percent move above entry shown in the evening grid: 1.0 means +1%.
+    move_percent: float = 1.0
