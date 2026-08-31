@@ -90,7 +90,7 @@ def run(symbol: str, raw: pd.DataFrame, cfg: TradingConfig) -> BacktestResult:
             i += 1
             continue
 
-        target = entry + risk_per_share * cfg.target_rr
+        target = entry * (1 + cfg.target_percent / 100.0)
         exit_price, exit_index = _simulate_exit(df, i, stop, target)
 
         pnl = (exit_price - entry) * shares

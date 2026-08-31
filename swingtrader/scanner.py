@@ -111,7 +111,7 @@ def analyze(
         return None
 
     risk_per_share = entry - stop
-    target = entry + (risk_per_share * cfg.target_rr)
+    target = entry * (1 + cfg.target_percent / 100.0)
     rr = (target - entry) / risk_per_share
 
     max_risk = cfg.account_size * cfg.risk_fraction
@@ -121,7 +121,7 @@ def analyze(
     shares_by_capital = math.floor(max_position_value / entry)
     shares = max(0, min(shares_by_risk, shares_by_capital))
 
-    if shares < 1 or rr < cfg.minimum_rr:
+    if shares < 1:
         return None
 
     risk_dollars = shares * risk_per_share

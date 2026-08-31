@@ -9,12 +9,10 @@ class TradingConfig:
     risk_fraction: float = 0.01
     # Largest portion of the account allowed in one position: 0.40 means 40%.
     max_position_fraction: float = 0.40
-    # A setup must offer at least this much potential reward for each $1 risked.
-    minimum_rr: float = 2.0
     # Stop distance below entry, measured in Average True Range (ATR) units.
     stop_atr_multiple: float = 1.5
-    # Profit target distance, expressed as a multiple of the planned risk.
-    target_rr: float = 2.5
+    # Profit target percent above entry: 1.0 means +1%.
+    target_percent: float = 1.0
     # Avoid low-priced stocks that can have large percentage swings and wide spreads.
     minimum_price: float = 5.0
     # Avoid stocks above the largest whole-share position this account can take by default.
@@ -29,5 +27,3 @@ class TradingConfig:
     sentiment_bonus_score: int = 5
     # Points subtracted from an otherwise valid setup with clearly negative headline sentiment.
     sentiment_penalty_score: int = 10
-    # Percent move above entry shown in the evening grid: 1.0 means +1%.
-    move_percent: float = 1.0

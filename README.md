@@ -61,12 +61,16 @@ Target a custom stock price range with `--min-price` and `--max-price`:
 python main.py scan --min-price 5 --max-price 25
 ```
 
-The evening grid reports a target percent move above the planned entry. It defaults
-to 1%; change it with `--move-percent`:
+The target defaults to a 1% profit above the planned entry. Change it with
+`--target-percent`:
 
 ```powershell
-python main.py scan --move-percent 2.5
+python main.py scan --target-percent 1.5
 ```
+
+The `R:R` column is still shown as context so you can compare the percent target
+against the ATR-based stop distance, but it no longer controls whether a candidate
+passes the scan.
 
 ## Run evening workflow
 
@@ -87,7 +91,7 @@ choose another report path:
 python main.py evening --symbols AAPL MSFT NVDA AMD TSLA
 python main.py evening --output data/scans/my-evening-report.json
 python main.py evening --min-price 5 --max-price 25
-python main.py evening --move-percent 2.5
+python main.py evening --target-percent 1.5
 ```
 
 The evening grid is a decision aid for the following session, not an automatic order
@@ -115,6 +119,12 @@ Backtest several symbols independently with the same V1 account assumptions:
 
 ```powershell
 python main.py backtest --symbols AAPL MSFT NVDA AMD TSLA
+```
+
+Backtests use the same percent target basis as scans:
+
+```powershell
+python main.py backtest --symbol AAPL --target-percent 1
 ```
 
 Each symbol gets its own result starting from the configured account size; this is
@@ -158,7 +168,7 @@ liquidity, or your risk rules.
 - Account size: $1,000
 - Risk per trade: 1% ($10)
 - Stock price range: $5 to $25
-- Minimum reward/risk: 2:1
+- Profit target: 1% above entry, adjustable with `--target-percent`
 - Maximum position value: 40% of account
 - Long-only
 - Daily bars

@@ -20,23 +20,27 @@ FALLBACK_SYMBOLS = [
 ]
 
 
-def build_config(minimum_price=None, maximum_price=None, move_percent=None):
+def build_config(
+    minimum_price=None,
+    maximum_price=None,
+    target_percent=None,
+):
     cfg = TradingConfig()
     minimum_price = cfg.minimum_price if minimum_price is None else minimum_price
     maximum_price = cfg.maximum_price if maximum_price is None else maximum_price
-    move_percent = cfg.move_percent if move_percent is None else move_percent
+    target_percent = cfg.target_percent if target_percent is None else target_percent
 
     if minimum_price > maximum_price:
         raise ValueError("Minimum price cannot be greater than maximum price.")
 
-    if move_percent <= 0:
-        raise ValueError("Move percent must be greater than zero.")
+    if target_percent <= 0:
+        raise ValueError("Target percent must be greater than zero.")
 
     return replace(
         cfg,
         minimum_price=minimum_price,
         maximum_price=maximum_price,
-        move_percent=move_percent,
+        target_percent=target_percent,
     )
 
 
@@ -189,16 +193,16 @@ def backtest(symbols, cfg=None):
 def print_evening_table(candidates, results, cfg=None):
     cfg = cfg or TradingConfig()
     results_by_symbol = {result.symbol: result for result in results}
-    move_percent = cfg.move_percent
-    move_label = f"{move_percent:g}%"
+    target_percent = cfg.target_percent
+    target_label = f"{target_percent:g}%"
 
     print("\n## Evening Swing Trade Grid\n")
     print(
-        f"| Rank | Symbol | Score | Setup | Entry | {move_label} Move | Price @ +{move_label} | "
-        "Stop | Target | Shares | "
+        f"| Rank | Symbol | Score | Setup | Entry | {target_label} Profit | Target | "
+        "Stop | Shares | "
         "Risk | R:R | Backtest Trades | Win Rate | Return | Drawdown | Fit |"
     )
-    print("|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+    print("|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
 
     rows = []
     for rank, candidate in enumerate(candidates, start=1):
@@ -207,12 +211,11 @@ def print_evening_table(candidates, results, cfg=None):
             continue
 
         fit = historical_fit(result)
-        target_move = candidate.entry * (move_percent / 100.0)
-        target_move_price = candidate.entry + target_move
+        target_profit = candidate.target - candidate.entry
         print(
             f"| {rank} | {candidate.symbol} | {candidate.score} | {candidate.setup} | "
-            f"${candidate.entry:.2f} | ${target_move:.2f} | ${target_move_price:.2f} | "
-            f"${candidate.stop:.2f} | ${candidate.target:.2f} | {candidate.shares} | "
+            f"${candidate.entry:.2f} | ${target_profit:.2f} | ${candidate.target:.2f} | "
+            f"${candidate.stop:.2f} | {candidate.shares} | "
             f"${candidate.risk_dollars:.2f} | {candidate.reward_risk:.1f} | {result.trades} | "
             f"{result.win_rate:.1f}% | {result.total_return:+.2f}% | {result.max_drawdown:.2f}% | {fit} |"
         )
@@ -221,9 +224,8 @@ def print_evening_table(candidates, results, cfg=None):
             "candidate": asdict(candidate),
             "backtest": asdict(result),
             "historical_fit": fit,
-            "move_percent": move_percent,
-            "move_amount": target_move,
-            "move_price": target_move_price,
+            "target_percent": target_percent,
+            "target_profit": target_profit,
         })
 
     if len(rows) < len(candidates):
@@ -358,9 +360,9 @@ if __name__ == "__main__":
     scan_parser.add_argument("--min-price", type=float, help="Minimum stock price to include")
     scan_parser.add_argument("--max-price", type=float, help="Maximum stock price to include")
     scan_parser.add_argument(
-        "--move-percent",
+        "--target-percent",
         type=float,
-        help="Percent move above entry to report (default 1.0)",
+        help="Profit target percent above entry (default 1.0)",
     )
 
     evening_parser = sub.add_parser(
@@ -372,15 +374,20 @@ if __name__ == "__main__":
     evening_parser.add_argument("--min-price", type=float, help="Minimum stock price to include")
     evening_parser.add_argument("--max-price", type=float, help="Maximum stock price to include")
     evening_parser.add_argument(
-        "--move-percent",
+        "--target-percent",
         type=float,
-        help="Percent move above entry to report (default 1.0)",
+        help="Profit target percent above entry (default 1.0)",
     )
 
     bt_parser = sub.add_parser("backtest")
     bt_symbols = bt_parser.add_mutually_exclusive_group(required=True)
     bt_symbols.add_argument("--symbol")
     bt_symbols.add_argument("--symbols", nargs="+")
+    bt_parser.add_argument(
+        "--target-percent",
+        type=float,
+        help="Profit target percent above entry (default 1.0)",
+    )
 
     args = parser.parse_args()
 
@@ -389,13 +396,26 @@ if __name__ == "__main__":
             args.symbols,
             args.output,
             args.top,
-            cfg=build_config(args.min_price, args.max_price, args.move_percent),
+            cfg=build_config(
+                args.min_price,
+                args.max_price,
+                args.target_percent,
+            ),
         )
     elif args.command == "evening":
         evening(
             args.symbols,
             args.output,
-            cfg=build_config(args.min_price, args.max_price, args.move_percent),
+            cfg=build_config(
+                args.min_price,
+                args.max_price,
+                args.target_percent,
+            ),
         )
     elif args.command == "backtest":
-        backtest(args.symbols or args.symbol)
+        backtest(
+            args.symbols or args.symbol,
+            cfg=build_config(
+                target_percent=args.target_percent,
+            ),
+        )
