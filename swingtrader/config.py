@@ -16,7 +16,7 @@ class TradingConfig:
     # Avoid low-priced stocks that can have large percentage swings and wide spreads.
     minimum_price: float = 5.0
     # Avoid stocks above the largest whole-share position this account can take by default.
-    maximum_price: float = 25.0
+    maximum_price: float = 30.0
     # Require this many shares traded per day on average over the last 20 days.
     minimum_average_volume: int = 500_000
     # Average headline sentiment at or above this value earns a small score bonus.
