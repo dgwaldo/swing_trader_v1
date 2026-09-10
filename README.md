@@ -9,7 +9,6 @@ A small Python research/scanning tool for a $1,000 swing-trading account.
 - Scores stocks using a transparent rules-based model
 - Calculates entry, stop, target, position size, and maximum dollar risk
 - Scores recent Yahoo Finance headlines for sentiment
-- Runs a simple historical backtest
 - Discovers liquid current movers through Yahoo Finance screeners
 - Prints a ranked Markdown candidate table
 - Saves each scan as a structured daily JSON snapshot
@@ -40,8 +39,7 @@ above $400, or below 500,000 current volume before the technical scan runs.
 
 Each scan also saves a structured JSON snapshot under `data/scans/`, including the
 scan date, symbols checked, and ranked candidates. Use `--output` to choose a
-different path. This is intended for downstream signal or execution modules; the
-backtester continues to use historical OHLCV data directly.
+different path. This is intended for downstream signal or execution modules.
 
 The terminal report is a Markdown table that can be pasted into a trade journal or
 notes app. It shows the entry, stop, target, shares, planned dollar risk,
@@ -72,20 +70,25 @@ The `R:R` column is still shown as context so you can compare the percent target
 against the ATR-based stop distance, but it no longer controls whether a candidate
 passes the scan.
 
+You can also scan a custom list:
+
+```powershell
+python main.py scan --symbols AAPL MSFT NVDA AMD AMZN META GOOGL TSLA PLTR
+```
+
 ## Run evening workflow
 
-For an after-hours next-day plan, scan the market, backtest the top 10 qualifying
-candidates, and print a combined grid in one command:
+For an after-hours next-day plan, scan the market and print a ranked grid of the
+top 10 qualifying candidates in one command:
 
 ```powershell
 python main.py evening
 ```
 
 The workflow uses the current live or extended-hours price for the planned entry,
-then recalculates the stop, target, shares, and planned risk. It uses five years of
-historical daily data for each selected candidate's backtest. The combined report
-is saved under `data/scans/evening_YYYY-MM-DD.json`. You can scan a specific list or
-choose another report path:
+then recalculates the stop, target, shares, and planned risk. The report is saved
+under `data/scans/evening_YYYY-MM-DD.json`. You can scan a specific list or choose
+another report path:
 
 ```powershell
 python main.py evening --symbols AAPL MSFT NVDA AMD TSLA
@@ -96,61 +99,14 @@ python main.py evening --target-percent 1.5
 
 The evening grid is a decision aid for the following session, not an automatic order
 system. Before placing an order, recheck the live bid/ask, spread, liquidity, and
-any overnight news. A backtest result is historical context, not a prediction.
+any overnight news.
 
 The evening command also prints a rules-based English `Buying Focus` brief beneath
-the grid. The grid and the brief use the same overall ranking, so Rank 1 is the best
-overall current opportunity, Rank 2 is the second best, and so on. Ranking starts
-with the live setup score, then uses historical fit, backtest return, win rate,
-drawdown, and trade count to break ties. The `Strong`, `Limited data`, and `Weak`
-labels remain visible as historical-context warnings; a high live rank with limited
-backtest data should still be treated cautiously. This is explainable local
-analysis, not a cloud AI model or financial advice.
+the grid. The grid and the brief use the same overall ranking: candidates are
+ordered by live setup score, then reward/risk. This is explainable local analysis,
+not a cloud AI model or financial advice.
 
 Generated scan snapshots are ignored by Git because they are daily runtime output.
-
-## Run backtest
-
-```powershell
-python main.py backtest --symbol AAPL
-```
-
-Backtest several symbols independently with the same V1 account assumptions:
-
-```powershell
-python main.py backtest --symbols AAPL MSFT NVDA AMD TSLA
-```
-
-Backtests use the same percent target basis as scans:
-
-```powershell
-python main.py backtest --symbol AAPL --target-percent 1
-```
-
-Each symbol gets its own result starting from the configured account size; this is
-not yet a combined portfolio backtest.
-
-Multi-symbol backtests print a Markdown comparison table with trades, wins, losses,
-win rate, total return, maximum drawdown, and historical fit. Results are sorted by
-historical fit first, then by total return.
-
-`Historical Fit` is a quick review label, not a prediction or a trade signal:
-
-| Historical Fit | Criteria |
-|---|---|
-| Strong | At least 10 trades, positive total return, and maximum drawdown at or below 5% |
-| Limited data | Fewer than 10 trades |
-| Weak | At least 10 trades with a negative return or drawdown above 5% |
-
-Use a positive historical fit alongside a valid current scan, not instead of one.
-Small samples can look impressive by chance, and a strong past result does not
-guarantee a future trade will work.
-
-You can also scan a custom list:
-
-```powershell
-python main.py scan --symbols AAPL MSFT NVDA AMD AMZN META GOOGL TSLA PLTR
-```
 
 ## Sentiment
 
@@ -172,7 +128,6 @@ liquidity, or your risk rules.
 - Maximum position value: 40% of account
 - Long-only
 - Daily bars
-- No commissions/slippage in V1 backtest
 - Signals are evaluated using completed daily candles
 
 ## Reading a trade plan
@@ -205,13 +160,7 @@ cap risk across multiple open positions.
    then run them with `python main.py scan --symbols ...`.
 3. Verify each candidate's chart, liquidity, bid/ask spread, and upcoming events.
 4. Paper trade the proposed entry, stop, target, and share count with an OCO bracket.
-5. Backtest a broad list of symbols and compare results across different periods.
-6. Keep a trade journal before considering real-money use.
+5. Keep a trade journal before considering real-money use.
 
 The scanner is a research tool, not an automatic trading system. Its output is not
-financial advice, and a backtest is not evidence that a strategy will be profitable
-in the future.
-
-The V1 backtester currently has no commissions or slippage, does not model a shared
-multi-symbol portfolio, and does not include survivorship-bias controls or proper
-out-of-sample testing.
+financial advice.

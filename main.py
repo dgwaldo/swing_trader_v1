@@ -4,7 +4,6 @@ from dataclasses import asdict, replace
 from datetime import date
 from pathlib import Path
 
-from swingtrader.backtest import run as run_backtest
 from swingtrader.config import TradingConfig
 from swingtrader.data import current_price, discover_symbols, download
 from swingtrader.scanner import analyze
@@ -114,122 +113,35 @@ def scan(symbols=None, output_path=None, top=15, cfg=None):
     return candidates
 
 
-def historical_fit(result):
-    if result.trades < 10:
-        return "Limited data"
-    if result.total_return > 0 and result.max_drawdown <= 5:
-        return "Strong"
-    return "Weak"
-
-
-def print_backtest_table(results):
-    print("\n## Backtest Results\n")
-    print("| Symbol | Trades | Wins | Losses | Win Rate | Total Return | Max Drawdown | Historical Fit |")
-    print("|---|---:|---:|---:|---:|---:|---:|---|")
-
-    for result in results:
-        print(
-            f"| {result.symbol} | {result.trades} | {result.wins} | "
-            f"{result.losses} | {result.win_rate:.1f}% | "
-            f"{result.total_return:+.2f}% | {result.max_drawdown:.2f}% | "
-            f"{historical_fit(result)} |"
-        )
-
-
-def rank_evening_candidates(candidates, results):
-    """Order picks by live setup quality, then historical evidence."""
-    results_by_symbol = {result.symbol: result for result in results}
-    fit_rank = {"Strong": 0, "Limited data": 1, "Weak": 2}
-
-    return sorted(
-        candidates,
-        key=lambda candidate: (
-            candidate.score,
-            -fit_rank.get(
-                historical_fit(results_by_symbol[candidate.symbol]),
-                len(fit_rank),
-            ) if candidate.symbol in results_by_symbol else -len(fit_rank),
-            results_by_symbol[candidate.symbol].total_return
-            if candidate.symbol in results_by_symbol else float("-inf"),
-            results_by_symbol[candidate.symbol].win_rate
-            if candidate.symbol in results_by_symbol else float("-inf"),
-            -results_by_symbol[candidate.symbol].max_drawdown
-            if candidate.symbol in results_by_symbol else float("-inf"),
-            results_by_symbol[candidate.symbol].trades
-            if candidate.symbol in results_by_symbol else -1,
-        ),
-        reverse=True,
-    )
-
-
-def backtest(symbols, cfg=None):
+def print_evening_table(candidates, cfg=None):
     cfg = cfg or TradingConfig()
-    if isinstance(symbols, str):
-        symbols = [symbols]
-
-    print(f"\n=== BACKTEST ({len(symbols)} SYMBOLS) ===")
-    results = []
-    for symbol in symbols:
-        print(f"\nDownloading {symbol}...")
-        try:
-            data = download(symbol, period="5y")
-            result = run_backtest(symbol, data, cfg)
-        except Exception as exc:
-            print(f"  ERROR: {exc}")
-            continue
-
-        results.append(result)
-
-    if not results:
-        print("No backtest results were produced.")
-        return []
-
-    fit_rank = {"Strong": 0, "Limited data": 1, "Weak": 2}
-    results.sort(key=lambda result: (fit_rank[historical_fit(result)], -result.total_return))
-    print_backtest_table(results)
-    return results
-
-
-def print_evening_table(candidates, results, cfg=None):
-    cfg = cfg or TradingConfig()
-    results_by_symbol = {result.symbol: result for result in results}
     target_percent = cfg.target_percent
     target_label = f"{target_percent:g}%"
 
     print("\n## Evening Swing Trade Grid\n")
     print(
         f"| Rank | Symbol | Score | Setup | Entry | {target_label} Profit | Target | "
-        "Stop | Shares | "
-        "Risk | R:R | Backtest Trades | Win Rate | Return | Drawdown | Fit |"
+        "Stop | Shares | Risk | R:R | Sentiment | Reasons |"
     )
-    print("|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+    print("|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
 
     rows = []
     for rank, candidate in enumerate(candidates, start=1):
-        result = results_by_symbol.get(candidate.symbol)
-        if result is None:
-            continue
-
-        fit = historical_fit(result)
         target_profit = candidate.target - candidate.entry
+        reasons = "; ".join(candidate.reasons)
         print(
             f"| {rank} | {candidate.symbol} | {candidate.score} | {candidate.setup} | "
             f"${candidate.entry:.2f} | ${target_profit:.2f} | ${candidate.target:.2f} | "
             f"${candidate.stop:.2f} | {candidate.shares} | "
-            f"${candidate.risk_dollars:.2f} | {candidate.reward_risk:.1f} | {result.trades} | "
-            f"{result.win_rate:.1f}% | {result.total_return:+.2f}% | {result.max_drawdown:.2f}% | {fit} |"
+            f"${candidate.risk_dollars:.2f} | {candidate.reward_risk:.1f} | "
+            f"{candidate.sentiment_score:+.2f} | {reasons} |"
         )
         rows.append({
             "rank": rank,
             "candidate": asdict(candidate),
-            "backtest": asdict(result),
-            "historical_fit": fit,
             "target_percent": target_percent,
             "target_profit": target_profit,
         })
-
-    if len(rows) < len(candidates):
-        print(f"\nBacktest results unavailable for {len(candidates) - len(rows)} pick(s).")
 
     return rows
 
@@ -240,7 +152,7 @@ def build_focus_analysis(rows):
         return {
             "headline": "No actionable picks were found tonight.",
             "focus": [],
-            "text": "No candidates had both a current scan signal and a completed backtest.",
+            "text": "No candidates had a current scan signal.",
         }
 
     ranked_symbols = [row["candidate"]["symbol"] for row in rows]
@@ -248,27 +160,10 @@ def build_focus_analysis(rows):
     second = ranked_symbols[1] if len(ranked_symbols) > 1 else None
     headline = f"Best overall bet: {best}."
     sentences = [
-        f"Rank 1 is {best}, followed by {second}. The ranking starts with live setup "
-        "quality and uses historical fit, return, win rate, drawdown, and trade count "
-        "to break ties." if second else
-        f"Rank 1 is {best}. The ranking combines live setup quality with historical results."
+        f"Rank 1 is {best}, followed by {second}. The ranking is driven by live setup "
+        "score, then reward/risk." if second else
+        f"Rank 1 is {best}. The ranking is driven by live setup score, then reward/risk."
     ]
-
-    strong = [
-        row["candidate"]["symbol"]
-        for row in rows
-        if row["historical_fit"] == "Strong"
-    ]
-    if strong:
-        sentences.append(
-            f"{', '.join(strong)} {('have' if len(strong) > 1 else 'has')} the most "
-            "established backtest support."
-        )
-    else:
-        sentences.append(
-            "No pick has the most established backtest support, so treat the list as a "
-            "watchlist rather than a buy list."
-        )
 
     secondary = [
         row["candidate"]["symbol"]
@@ -278,27 +173,7 @@ def build_focus_analysis(rows):
     if secondary:
         sentences.append(
             f"Keep {', '.join(secondary)} as the next watchlist names, but review their "
-            "entry price and historical results before placing orders."
-        )
-
-    weak = [
-        row["candidate"]["symbol"]
-        for row in rows
-        if row["historical_fit"] == "Weak"
-    ]
-    if weak:
-        sentences.append(
-            f"Be cautious with {', '.join(weak)} because the backtest is classified as Weak."
-        )
-
-    limited = [
-        row["candidate"]["symbol"]
-        for row in rows
-        if row["historical_fit"] == "Limited data"
-    ]
-    if limited:
-        sentences.append(
-            f"Treat {', '.join(limited)} cautiously because the backtest has limited data."
+            "entry price and setup quality before placing orders."
         )
 
     sentences.append(
@@ -314,15 +189,13 @@ def build_focus_analysis(rows):
 
 
 def evening(symbols=None, output_path=None, cfg=None):
-    """Create an after-hours top-10 scan, backtest those picks, and print one grid."""
+    """Create an after-hours top-10 scan and print the ranked grid."""
     cfg = cfg or TradingConfig()
     candidates = scan(symbols=symbols, top=10, cfg=cfg)
     if not candidates:
         return
 
-    results = backtest([candidate.symbol for candidate in candidates], cfg=cfg)
-    candidates = rank_evening_candidates(candidates, results)
-    rows = print_evening_table(candidates, results, cfg=cfg)
+    rows = print_evening_table(candidates, cfg=cfg)
     analysis = build_focus_analysis(rows)
 
     print("\n## Buying Focus\n")
@@ -367,23 +240,13 @@ if __name__ == "__main__":
 
     evening_parser = sub.add_parser(
         "evening",
-        help="Scan, backtest the top 10 picks, and print a combined grid",
+        help="Scan and print a ranked next-day grid",
     )
     evening_parser.add_argument("--symbols", nargs="+", help="Optional symbols to scan")
     evening_parser.add_argument("--output", help="Path for the combined evening report")
     evening_parser.add_argument("--min-price", type=float, help="Minimum stock price to include")
     evening_parser.add_argument("--max-price", type=float, help="Maximum stock price to include")
     evening_parser.add_argument(
-        "--target-percent",
-        type=float,
-        help="Profit target percent above entry (default 1.0)",
-    )
-
-    bt_parser = sub.add_parser("backtest")
-    bt_symbols = bt_parser.add_mutually_exclusive_group(required=True)
-    bt_symbols.add_argument("--symbol")
-    bt_symbols.add_argument("--symbols", nargs="+")
-    bt_parser.add_argument(
         "--target-percent",
         type=float,
         help="Profit target percent above entry (default 1.0)",
@@ -410,12 +273,5 @@ if __name__ == "__main__":
                 args.min_price,
                 args.max_price,
                 args.target_percent,
-            ),
-        )
-    elif args.command == "backtest":
-        backtest(
-            args.symbols or args.symbol,
-            cfg=build_config(
-                target_percent=args.target_percent,
             ),
         )

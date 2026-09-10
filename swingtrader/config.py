@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class TradingConfig:
-    # Starting balance used for position sizing and backtests.
+    # Starting balance used for position sizing.
     account_size: float = 1000.0
     # Largest planned loss per trade: 0.01 means 1% of the account ($10 here).
     risk_fraction: float = 0.01
