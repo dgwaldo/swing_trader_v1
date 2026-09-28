@@ -37,7 +37,19 @@ python main.py --symbols SOFI PLTR AGRO ABUS AES
 python main.py --top 10 --min-price 5 --max-price 30
 ```
 
-Each run outputs a Markdown candidate table and saves a structured snapshot under `data/scans/scan_YYYY-MM-DD.json`.
+Each run prints a Markdown candidate table, saves a structured snapshot under
+`data/scans/scan_YYYY-MM-DD.json`, and creates a new Markdown report under
+`data/scans/scan_YYYY-MM-DD_HH-MM-SS_microseconds.md`. Open the report in VS Code's
+Markdown preview to see the rendered table. Reports include scan progress, candidates
+(or the no-candidates message), and total runtime. Repeated runs never overwrite an
+earlier report.
+
+Daily OHLCV histories are cached under `data/cache/ohlcv`. Repeated scans on the
+same day reuse the cache; later scans fetch recent bars and merge them into the
+stored one-year history. The CLI prints total application runtime when it finishes.
+Technical signals remain based on completed daily candles. After qualification,
+candidate entries, stops, targets, and share counts are refreshed in batches using
+the latest available one-minute trade, including pre-market and after-hours bars.
 
 ## Sentiment & Catalyst Classification
 
@@ -54,7 +66,7 @@ Sentiment is a minor ranking adjustment, not an entry signal. Never let sentimen
 - Maximum position value: 40% of account ($400)
 - Long-only
 - Daily bars
-- Signals are evaluated using completed daily candles and current market price
+- Signals and entries are evaluated using the latest completed adjusted daily close
 
 ## Reading a trade plan
 

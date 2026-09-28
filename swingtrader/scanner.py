@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import pandas as pd
 
@@ -27,6 +27,8 @@ class TradeCandidate:
     reasons: list[str]
     sentiment_score: float = 0.0
     sentiment_headline: str | None = None
+    reference_close: float | None = None
+    price_change_pct: float | None = None
 
 
 def evaluate_risk_rating(atr_pct: float, prob_loss_5d: float) -> str:
@@ -37,6 +39,51 @@ def evaluate_risk_rating(atr_pct: float, prob_loss_5d: float) -> str:
         return "Medium"
     else:
         return "High"
+
+
+def refresh_candidate_price(
+    candidate: TradeCandidate,
+    latest_price: float,
+    cfg: TradingConfig,
+) -> TradeCandidate | None:
+    """Recalculate execution values using a current regular or extended-hours price."""
+    if latest_price < cfg.minimum_price or latest_price > cfg.maximum_price:
+        return None
+
+    atr = (candidate.entry - candidate.stop) / cfg.stop_atr_multiple
+    stop = latest_price - (atr * cfg.stop_atr_multiple)
+    if atr <= 0 or stop <= 0 or stop >= latest_price:
+        return None
+
+    risk_per_share = latest_price - stop
+    max_risk = cfg.account_size * cfg.risk_fraction
+    max_position_value = cfg.account_size * cfg.max_position_fraction
+    shares = max(
+        0,
+        min(
+            math.floor(max_risk / risk_per_share),
+            math.floor(max_position_value / latest_price),
+        ),
+    )
+    if shares < 1:
+        return None
+
+    reference_close = candidate.reference_close or candidate.entry
+    target_1 = latest_price + max(risk_per_share * 1.5, latest_price * 0.08)
+    return replace(
+        candidate,
+        entry=latest_price,
+        stop=stop,
+        target_1pct=latest_price * (1 + cfg.target_percent / 100.0),
+        target_1=target_1,
+        target_2=latest_price + max(risk_per_share * 3.0, latest_price * 0.16),
+        shares=shares,
+        risk_dollars=shares * risk_per_share,
+        reward_risk=(target_1 - latest_price) / risk_per_share,
+        risk_rating=evaluate_risk_rating(atr / latest_price, candidate.prob_loss_5d),
+        reference_close=reference_close,
+        price_change_pct=(latest_price / reference_close) - 1,
+    )
 
 
 def analyze(
@@ -182,4 +229,5 @@ def analyze(
         reasons=reasons,
         sentiment_score=sentiment.score,
         sentiment_headline=sentiment.headline,
+        reference_close=price,
     )
