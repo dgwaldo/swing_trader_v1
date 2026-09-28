@@ -22,6 +22,35 @@ py -m venv .venv
 pip install -r requirements.txt
 ```
 
+For Alpaca paper trading, copy `config.example.py` to `config.py` in the project
+root and fill in `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` with your **paper**
+account credentials. The example also lists the scanner, sizing, sentiment, and
+paper quote limits in `TRADING_CONFIG`; edit them in your local copy to change
+the defaults. `--min-price` and `--max-price` override the local price settings
+for a run. The local `config.py` is ignored by Git; do not commit or paste your
+keys. A regular `python main.py` scan does not need credentials or a config file.
+
+## Alpaca Paper Workflow
+
+Paper modes require `alpaca-py` from `requirements.txt` and a saved, ignored
+root `config.py` with **paper** keys. Use these commands during regular US
+market hours for preview or entry:
+
+```powershell
+python main.py --paper-preview     # Scan and check the top candidate; no order
+python main.py --paper-trade       # Submit one paper limit-entry bracket order
+python main.py --paper-status      # Read-only account/order inspection; no scan
+python main.py --paper-reconcile   # Request cancellation of timed-out, unfilled bot entries
+```
+
+The last two commands work outside market hours. Reconciliation requests
+cancellation after ten minutes only for this bot's bracket entries with zero
+filled shares; verify the broker accepted the cancellation. Partial fills and
+missing exit legs require manual review in Alpaca. These are one-shot commands,
+not an unattended scheduler. Validate a real paper fill and its exits in the
+Alpaca dashboard before relying on `--paper-trade`; neither tests nor a preview
+prove broker execution, and stops cannot guarantee the planned loss.
+
 ## Run scanner
 
 To scan the entire NYSE and NASDAQ universe ($5–$30, >500k volume) and return the Top 25 candidates:

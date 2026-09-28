@@ -1,4 +1,9 @@
 from dataclasses import dataclass
+from pathlib import Path
+import runpy
+
+
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.py"
 
 
 @dataclass(frozen=True)
@@ -27,3 +32,15 @@ class TradingConfig:
     sentiment_bonus_score: int = 5
     # Points subtracted from an otherwise valid setup with clearly negative headline sentiment.
     sentiment_penalty_score: int = 10
+    max_spread_fraction: float = 0.01
+    max_price_drift_fraction: float = 0.02
+    max_quote_age_seconds: int = 60
+
+
+def load_trading_config(path: Path = CONFIG_PATH) -> TradingConfig:
+    if not path.is_file():
+        return TradingConfig()
+    config = runpy.run_path(str(path)).get("TRADING_CONFIG", TradingConfig())
+    if not isinstance(config, TradingConfig):
+        raise ValueError("TRADING_CONFIG in config.py must be a TradingConfig instance")
+    return config

@@ -7,7 +7,7 @@ from datetime import date, datetime
 from pathlib import Path
 from time import perf_counter
 
-from swingtrader.config import TradingConfig
+from swingtrader.config import TradingConfig, load_trading_config
 from swingtrader.data import (
     download_batch,
     download_latest_prices,
@@ -47,7 +47,7 @@ def build_config(
     minimum_price=None,
     maximum_price=None,
 ):
-    cfg = TradingConfig()
+    cfg = load_trading_config()
     minimum_price = cfg.minimum_price if minimum_price is None else minimum_price
     maximum_price = cfg.maximum_price if maximum_price is None else maximum_price
 
@@ -175,18 +175,42 @@ def main():
             parser.add_argument("--top", type=int, default=25, help="Number of top candidates to return (default 25)")
             parser.add_argument("--min-price", type=float, help="Minimum stock price (default $5.00)")
             parser.add_argument("--max-price", type=float, help="Maximum stock price (default $30.00)")
+            paper_modes = parser.add_mutually_exclusive_group()
+            paper_modes.add_argument("--paper-preview", action="store_true", help="Check top candidate against Alpaca paper quotes without placing an order")
+            paper_modes.add_argument("--paper-trade", action="store_true", help="Submit one Alpaca paper bracket order for the top candidate")
+            paper_modes.add_argument("--paper-status", action="store_true", help="Inspect Alpaca paper positions and orders without changing them")
+            paper_modes.add_argument("--paper-reconcile", action="store_true", help="Inspect paper orders and request cancellation of stale unfilled bot entries")
 
             args = parser.parse_args()
-            config = build_config(
-                minimum_price=args.min_price,
-                maximum_price=args.max_price,
-            )
-            run_scanner(
-                symbols=args.symbols,
-                output_path=args.output,
-                top=args.top,
-                cfg=config,
-            )
+            if args.paper_status or args.paper_reconcile:
+                from swingtrader.paper_trading import report_paper_status
+
+                report_paper_status(cancel_stale=args.paper_reconcile)
+            else:
+                config = build_config(
+                    minimum_price=args.min_price,
+                    maximum_price=args.max_price,
+                )
+                candidates = run_scanner(
+                    symbols=args.symbols,
+                    output_path=args.output,
+                    top=args.top,
+                    cfg=config,
+                )
+                if args.paper_preview or args.paper_trade:
+                    if not candidates:
+                        print("No candidate available for a paper order.")
+                    else:
+                        from swingtrader.paper_trading import submit_paper_candidate
+
+                        try:
+                            plan = submit_paper_candidate(candidates[0], config, execute=args.paper_trade)
+                            print(f"\n## Alpaca Paper {'Order' if args.paper_trade else 'Preview'}\n")
+                            print(f"{plan.symbol}: buy {plan.shares} @ <= ${plan.limit_price:.2f}; "
+                                  f"stop ${plan.stop_price:.2f}; take profit ${plan.target_price:.2f}; "
+                                  f"planned risk ${plan.risk_dollars:.2f}")
+                        except ValueError as exc:
+                            print(f"\nPaper order skipped: {exc}")
         finally:
             elapsed = perf_counter() - started_at
             print(f"\nTotal application runtime: {elapsed:.2f} seconds")
