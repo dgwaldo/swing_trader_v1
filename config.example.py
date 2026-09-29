@@ -20,7 +20,13 @@ TRADING_CONFIG = TradingConfig(
 	sentiment_negative_threshold=-0.2,    # Negative headline threshold (VADER score).
 	sentiment_bonus_score=5,              # Points added for positive headlines.
 	sentiment_penalty_score=10,           # Points removed for negative headlines.
-	max_spread_fraction=0.01,             # Paper order: reject spreads wider than 1%.
+	max_spread_fraction=0.002,            # Paper order: reject spreads wider than 0.2%.
 	max_price_drift_fraction=0.02,        # Paper order: reject ask >2% from scan price.
 	max_quote_age_seconds=60,             # Paper order: maximum Alpaca quote age.
+	estimated_exit_cost_fraction=0.001,   # Paper target: 0.1% allowance for estimated sale costs.
+	max_open_positions=5,                 # Bot: positions plus pending entries.
+	daily_loss_fraction=0.02,             # Bot: pause new buys after 2% daily account loss.
+	max_combined_risk_fraction=0.10,      # Bot: maximum planned downside across open trades.
+	bot_poll_seconds=300,                 # Bot: reconcile broker orders every five minutes.
+	bot_scan_interval_seconds=900,        # Bot: rescan open slots every fifteen minutes.
 )

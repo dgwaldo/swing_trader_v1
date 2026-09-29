@@ -32,9 +32,15 @@ class TradingConfig:
     sentiment_bonus_score: int = 5
     # Points subtracted from an otherwise valid setup with clearly negative headline sentiment.
     sentiment_penalty_score: int = 10
-    max_spread_fraction: float = 0.01
+    max_spread_fraction: float = 0.002
     max_price_drift_fraction: float = 0.02
     max_quote_age_seconds: int = 60
+    estimated_exit_cost_fraction: float = 0.001
+    max_open_positions: int = 5
+    daily_loss_fraction: float = 0.02
+    max_combined_risk_fraction: float = 0.10
+    bot_poll_seconds: int = 300
+    bot_scan_interval_seconds: int = 900
 
 
 def load_trading_config(path: Path = CONFIG_PATH) -> TradingConfig:

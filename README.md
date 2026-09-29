@@ -46,10 +46,53 @@ python main.py --paper-reconcile   # Request cancellation of timed-out, unfilled
 The last two commands work outside market hours. Reconciliation requests
 cancellation after ten minutes only for this bot's bracket entries with zero
 filled shares; verify the broker accepted the cancellation. Partial fills and
-missing exit legs require manual review in Alpaca. These are one-shot commands,
-not an unattended scheduler. Validate a real paper fill and its exits in the
+missing exit legs require manual review in Alpaca. Validate a real paper fill and its exits in the
 Alpaca dashboard before relying on `--paper-trade`; neither tests nor a preview
 prove broker execution, and stops cannot guarantee the planned loss.
+
+## Paper Bot (Experimental)
+
+After verifying the one-shot paper workflow in Alpaca, start the paper-only bot
+from the project directory with `python main.py --paper-bot`. Keep the process
+running; stop it with Ctrl+C. `python main.py --paper-bot-once` performs one cycle
+and exits (it **can place paper orders**). Both modes require paper credentials.
+Only one bot instance can run at a time. Outside regular US market hours the bot
+reconciles broker state but does not place entries. Between 10:00 and 15:30 New
+York time, it scans every 15 minutes while a position slot and planned-risk
+budget remain available, and checks broker state every five minutes by default.
+It skips any symbol already attempted by the paper bot that trading day, even
+if its entry was canceled or its position has closed. A scan does not guarantee
+that a candidate or an order fill will be available.
+
+Before every entry, the bot fetches fresh Alpaca quotes, positions and orders.
+It enforces a five-position limit (including pending entries), 2% daily loss
+pause, 10% combined planned downside, the existing per-trade risk setting
+(1% by default, never over 2% in bot mode), and no more invested or reserved
+than `account_size`. All three bot limits, `bot_poll_seconds`, and
+`bot_scan_interval_seconds` are configurable in `TRADING_CONFIG`. Daily loss uses
+Alpaca account equity versus previous-day
+equity and includes other account activity; the bot does not liquidate existing
+positions when the daily limit is reached. With $1,000 sizing, the default
+per-trade risk is $10, daily pause is $20, and combined planned downside is
+at most $100. Stops can slip beyond those planned limits.
+
+The bot stores broker-reported fills, including buys and sells, idempotently
+in `data/paper_fills.sqlite3`. This is a gross fill ledger, not a fee-adjusted
+net-return report. Unknown positions, partial fills, missing exit legs, pending
+cancellations, order-history overflow and approaching GTC expiry stop new buys;
+check Alpaca and repair those situations manually. The bot does **not** yet
+renew a bracket before Alpaca's 90-day GTC cancellation or automatically close
+a position at 180 days. Do not leave it unmonitored for long holds or treat this
+as proof of a profitable strategy.
+
+Paper orders use the configured `target_percent` (1% by default) plus an
+`estimated_exit_cost_fraction` allowance (0.1% by default), calculated against
+sale proceeds from the buy limit price and rounded up to the next cent. The default quote-spread
+limit is 0.2% of midpoint. These are conservative planning assumptions, not
+measured trading costs or a guarantee of 1% realized net profit; calculate
+actual net results from broker fills and fees. Alpaca's GTC orders are subject
+to an aged-order cancellation policy after 90 days, so this workflow cannot
+leave a 180-day position unattended without checking and renewing its exits.
 
 ## Run scanner
 

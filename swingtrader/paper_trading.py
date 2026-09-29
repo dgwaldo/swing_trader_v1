@@ -1,9 +1,12 @@
 import math
 import runpy
-from dataclasses import dataclass
+import sqlite3
+from contextlib import closing
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from .config import TradingConfig
 from .scanner import TradeCandidate
@@ -11,6 +14,7 @@ from .scanner import TradeCandidate
 
 CREDENTIALS_PATH = Path(__file__).resolve().parent.parent / "config.py"
 ENTRY_TIMEOUT = timedelta(minutes=10)
+FILLS_PATH = Path("data") / "paper_fills.sqlite3"
 
 
 @dataclass(frozen=True)
@@ -21,6 +25,104 @@ class PaperOrderPlan:
     stop_price: float
     target_price: float
     risk_dollars: float
+
+
+@dataclass(frozen=True)
+class BotCapacity:
+    slots: int
+    remaining_risk: float
+    symbols: frozenset[str]
+
+
+def record_paper_fills(orders, path: Path = FILLS_PATH) -> int:
+    filled = []
+    for order in orders:
+        if not str(order.client_order_id or "").startswith("swing-paper-"):
+            continue
+        for trade in [order, *(order.legs or [])]:
+            if getattr(trade.status, "value", trade.status) != "filled":
+                continue
+            if trade.filled_at is None or trade.filled_at.tzinfo is None or trade.filled_avg_price is None:
+                raise ValueError(f"{order.symbol}: incomplete broker fill; manual review required")
+            filled.append((str(trade.id), str(order.id), order.symbol,
+                           str(getattr(trade.side, "value", trade.side)), str(trade.filled_qty),
+                           str(trade.filled_avg_price), trade.filled_at.isoformat()))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path)) as database, database:
+        database.execute("""CREATE TABLE IF NOT EXISTS fills (
+            order_id TEXT PRIMARY KEY, entry_id TEXT NOT NULL, symbol TEXT NOT NULL,
+            side TEXT NOT NULL, qty TEXT NOT NULL, price TEXT NOT NULL, filled_at TEXT NOT NULL
+        )""")
+        before = database.total_changes
+        database.executemany("INSERT OR IGNORE INTO fills VALUES (?, ?, ?, ?, ?, ?, ?)", filled)
+        return database.total_changes - before
+
+
+def check_bot_daily_halt(account, cfg: TradingConfig, now: datetime, path: Path = FILLS_PATH) -> None:
+    balance = min(float(account.equity), cfg.account_size)
+    if not math.isfinite(balance) or balance <= 0 or not 0 < cfg.daily_loss_fraction < 1:
+        raise ValueError("Invalid paper bot daily loss limit or balance")
+    trading_day = now.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path)) as database, database:
+        database.execute("CREATE TABLE IF NOT EXISTS daily_halts (trading_day TEXT PRIMARY KEY)")
+        if float(account.last_equity) - float(account.equity) >= balance * cfg.daily_loss_fraction:
+            database.execute("INSERT OR IGNORE INTO daily_halts VALUES (?)", (trading_day,))
+        database.commit()
+        if database.execute("SELECT 1 FROM daily_halts WHERE trading_day = ?", (trading_day,)).fetchone():
+            raise ValueError("Daily paper loss limit reached; no new entries until next trading day")
+
+
+def bot_capacity(account, positions, orders, cfg: TradingConfig, now: datetime) -> BotCapacity:
+    if cfg.max_open_positions < 1 or not 0 < cfg.daily_loss_fraction < 1 or not 0 < cfg.max_combined_risk_fraction < 1:
+        raise ValueError("Invalid paper bot risk limits")
+    balance = min(float(account.equity), cfg.account_size)
+    if not math.isfinite(balance) or balance <= 0:
+        raise ValueError("Invalid paper account balance")
+    if float(account.last_equity) - float(account.equity) >= balance * cfg.daily_loss_fraction:
+        raise ValueError("Daily paper loss limit reached; no new entries")
+
+    active = {"new", "accepted", "pending_new", "partially_filled", "done_for_day"}
+    symbols = set()
+    planned_risk = 0.0
+    entries = [order for order in orders if str(order.client_order_id or "").startswith("swing-paper-")]
+    if any(getattr(order.status, "value", order.status) in {"pending_cancel", "pending_replace"}
+           for order in entries):
+        raise ValueError("Paper order change pending; verify broker status before new entries")
+    for position in positions:
+        matching = [order for order in entries if order.symbol == position.symbol
+                    and getattr(order.status, "value", order.status) == "filled"]
+        if not matching or any(order.filled_at is None for order in matching):
+            raise ValueError(f"{position.symbol}: cannot verify paper entry; manual review required")
+        entry = max(matching, key=lambda order: order.filled_at)
+        if entry.filled_at is None or entry.filled_at.tzinfo is None or now - entry.filled_at >= timedelta(days=85):
+            raise ValueError(f"{position.symbol}: paper exits are nearing GTC expiry; manual review required")
+        legs = entry.legs or []
+        stop_legs = [leg for leg in legs if getattr(leg.type, "value", leg.type) == "stop"
+                     and getattr(leg.status, "value", leg.status) in active]
+        profit_legs = [leg for leg in legs if getattr(leg.type, "value", leg.type) == "limit"
+                       and getattr(leg.status, "value", leg.status) in active]
+        if len(stop_legs) != 1 or len(profit_legs) != 1 or float(stop_legs[0].qty) < float(position.qty):
+            raise ValueError(f"{position.symbol}: paper exits unverified; manual review required")
+        planned_risk += max(0.0, float(position.avg_entry_price) - float(stop_legs[0].stop_price)) * float(position.qty)
+        symbols.add(position.symbol)
+
+    for order in orders:
+        status = getattr(order.status, "value", order.status)
+        if status not in active or getattr(order.side, "value", order.side) != "buy":
+            continue
+        if order not in entries or order.symbol in symbols or float(order.filled_qty or 0) > 0:
+            raise ValueError(f"{order.symbol}: unverified pending paper entry; manual review required")
+        if order.limit_price is None or order.legs is None:
+            raise ValueError(f"{order.symbol}: pending entry has no verified stop")
+        stops = [leg for leg in order.legs if getattr(leg.type, "value", leg.type) == "stop"]
+        if len(stops) != 1 or stops[0].stop_price is None:
+            raise ValueError(f"{order.symbol}: pending entry has no verified stop")
+        symbols.add(order.symbol)
+        planned_risk += max(0.0, float(order.limit_price) - float(stops[0].stop_price)) * float(order.qty)
+
+    return BotCapacity(cfg.max_open_positions - len(symbols),
+                       balance * cfg.max_combined_risk_fraction - planned_risk, frozenset(symbols))
 
 
 def _cent(price: float, rounding: str) -> float:
@@ -39,6 +141,31 @@ def load_paper_credentials(path: Path = CREDENTIALS_PATH) -> tuple[str, str]:
     if not isinstance(key, str) or not key.strip() or not isinstance(secret, str) or not secret.strip():
         raise ValueError("Set APCA_API_KEY_ID and APCA_API_SECRET_KEY in config.py to Alpaca paper credentials")
     return key, secret
+
+
+def paper_bot_snapshot():
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.enums import QueryOrderStatus
+    from alpaca.trading.requests import GetOrdersRequest
+
+    key, secret = load_paper_credentials()
+    trading = TradingClient(key, secret, paper=True)
+    orders = trading.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.ALL, nested=True, limit=500))
+    if len(orders) >= 500:
+        raise ValueError("Paper order history limit reached; manual review required")
+    return trading, orders
+
+
+def bot_attempted_today(orders, symbol: str, now: datetime) -> bool:
+    trading_day = now.astimezone(ZoneInfo("America/New_York")).date()
+    for order in orders:
+        if order.symbol != symbol or not str(order.client_order_id or "").startswith("swing-paper-"):
+            continue
+        if order.created_at is None or order.created_at.tzinfo is None:
+            raise ValueError(f"{symbol}: bot order timestamp missing; manual review required")
+        if order.created_at.astimezone(ZoneInfo("America/New_York")).date() == trading_day:
+            return True
+    return False
 
 
 def review_paper_orders(trading, orders, now: datetime, *, cancel_stale: bool = False) -> list[str]:
@@ -101,6 +228,8 @@ def report_paper_status(*, cancel_stale: bool = False) -> None:
 
 
 def plan_paper_order(candidate: TradeCandidate, bid: float, ask: float, cfg: TradingConfig) -> PaperOrderPlan:
+    if not 0 <= cfg.estimated_exit_cost_fraction < 1 or cfg.target_percent <= 0:
+        raise ValueError("Invalid paper target or exit cost allowance")
     if not all(math.isfinite(value) for value in (bid, ask, candidate.entry, candidate.stop)):
         raise ValueError("Invalid price or quote")
     if bid <= 0 or ask < bid:
@@ -121,11 +250,15 @@ def plan_paper_order(candidate: TradeCandidate, bid: float, ask: float, cfg: Tra
     )
     if shares < 1:
         raise ValueError("No whole shares fit the configured risk and position limits")
-    target_price = _cent(limit_price + max(risk_per_share * 1.5, limit_price * 0.08), ROUND_CEILING)
+    target_price = _cent(
+        limit_price * (1 + cfg.target_percent / 100) / (1 - cfg.estimated_exit_cost_fraction),
+        ROUND_CEILING,
+    )
     return PaperOrderPlan(candidate.symbol, shares, limit_price, stop_price, target_price, shares * risk_per_share)
 
 
-def submit_paper_candidate(candidate: TradeCandidate, cfg: TradingConfig, *, execute: bool = False) -> PaperOrderPlan:
+def submit_paper_candidate(candidate: TradeCandidate, cfg: TradingConfig, *, execute: bool = False,
+                           bot_mode: bool = False) -> PaperOrderPlan:
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockLatestQuoteRequest
     from alpaca.trading.client import TradingClient
@@ -140,7 +273,8 @@ def submit_paper_candidate(candidate: TradeCandidate, cfg: TradingConfig, *, exe
     account = trading.get_account()
     if account.trading_blocked:
         raise ValueError("Paper account is blocked from trading")
-    if any(position.symbol == candidate.symbol for position in trading.get_all_positions()):
+    positions = trading.get_all_positions()
+    if any(position.symbol == candidate.symbol for position in positions):
         raise ValueError(f"Already holding {candidate.symbol} in the paper account")
     if trading.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[candidate.symbol])):
         raise ValueError(f"Open paper order already exists for {candidate.symbol}")
@@ -156,6 +290,30 @@ def submit_paper_candidate(candidate: TradeCandidate, cfg: TradingConfig, *, exe
     plan = plan_paper_order(candidate, float(quote.bid_price), float(quote.ask_price), cfg)
 
     available_cash = min(float(account.cash), float(account.buying_power))
+    if bot_mode:
+        if not 0 < cfg.risk_fraction <= 0.02:
+            raise ValueError("Paper bot per-trade risk must not exceed 2%")
+        check_bot_daily_halt(account, cfg, datetime.now(timezone.utc))
+        orders = trading.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.ALL, nested=True, limit=500))
+        if len(orders) >= 500:
+            raise ValueError("Paper order history limit reached; manual review required")
+        if bot_attempted_today(orders, candidate.symbol, datetime.now(timezone.utc)):
+            raise ValueError(f"{candidate.symbol}: paper bot already attempted this symbol today")
+        capacity = bot_capacity(account, positions, orders, cfg, datetime.now(timezone.utc))
+        if capacity.slots <= 0:
+            raise ValueError("Paper bot position limit reached")
+        invested = sum(abs(float(position.market_value)) for position in positions)
+        reserved = sum(float(order.limit_price) * (float(order.qty) - float(order.filled_qty or 0))
+                       for order in orders if getattr(order.status, "value", order.status)
+                       in {"new", "accepted", "pending_new", "partially_filled", "done_for_day"}
+                       and getattr(order.side, "value", order.side) == "buy")
+        remaining_capital = max(0.0, min(float(account.equity), cfg.account_size) - invested - reserved)
+        risk_per_share = plan.limit_price - plan.stop_price
+        shares = min(plan.shares, math.floor(max(0.0, capacity.remaining_risk) / risk_per_share),
+                     math.floor(remaining_capital / plan.limit_price))
+        if shares < 1:
+            raise ValueError("No whole shares fit remaining paper bot risk and capital limits")
+        plan = replace(plan, shares=shares, risk_dollars=shares * risk_per_share)
     if plan.shares * plan.limit_price > available_cash:
         raise ValueError("Insufficient paper account cash for planned order")
 

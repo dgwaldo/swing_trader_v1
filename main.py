@@ -1,11 +1,12 @@
 import argparse
 import json
 import sys
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import asdict, replace
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, sleep
+from zoneinfo import ZoneInfo
 
 from swingtrader.config import TradingConfig, load_trading_config
 from swingtrader.data import (
@@ -26,6 +27,7 @@ FALLBACK_SYMBOLS = [
 ]
 
 REPORT_DIR = Path("data") / "scans"
+BOT_LOCK_PATH = Path("data") / "paper_bot.lock"
 
 
 class ReportOutput:
@@ -153,6 +155,107 @@ def run_scanner(symbols=None, output_path=None, top=25, cfg=None):
     return candidates
 
 
+def run_paper_bot_cycle(cfg, symbols=None, top=25, *, scan=run_scanner, now=None):
+    from swingtrader.paper_trading import (
+        bot_attempted_today, bot_capacity, check_bot_daily_halt, paper_bot_snapshot, record_paper_fills,
+        review_paper_orders,
+        submit_paper_candidate,
+    )
+
+    now = now or datetime.now(timezone.utc)
+    trading, orders = paper_bot_snapshot()
+    new_fills = record_paper_fills(orders)
+    if new_fills:
+        print(f"Recorded {new_fills} paper fills in the local ledger")
+    messages = review_paper_orders(trading, orders, now, cancel_stale=True)
+    for message in messages:
+        print(message)
+    if any("manual review" in message or "cancellation requested" in message for message in messages):
+        print("Paper bot paused: verify orders before any new entries")
+        return False
+    account = trading.get_account()
+    positions = trading.get_all_positions()
+    try:
+        check_bot_daily_halt(account, cfg, now)
+        capacity = bot_capacity(account, positions, orders, cfg, now)
+    except ValueError as exc:
+        print(f"Paper bot paused: {exc}")
+        return False
+    if scan is None:
+        return False
+    local_time = now.astimezone(ZoneInfo("America/New_York"))
+    if not trading.get_clock().is_open or not (10, 0) <= (local_time.hour, local_time.minute) < (15, 30):
+        return False
+    if capacity.slots <= 0 or capacity.remaining_risk <= 0:
+        print("Paper bot at position or planned-risk limit")
+        return False
+
+    candidates = scan(symbols=symbols, top=top, cfg=cfg)
+    for candidate in candidates:
+        if candidate.symbol in capacity.symbols or bot_attempted_today(orders, candidate.symbol, now):
+            continue
+        try:
+            plan = submit_paper_candidate(candidate, cfg, execute=True, bot_mode=True)
+            print(f"Paper bot: {plan.symbol} buy {plan.shares} @ <= ${plan.limit_price:.2f}; "
+                  f"stop ${plan.stop_price:.2f}; target ${plan.target_price:.2f}")
+        except ValueError as exc:
+            print(f"Paper bot skipped {candidate.symbol}: {exc}")
+    return True
+
+
+def run_paper_bot(cfg, symbols=None, top=25, *, once=False):
+    if cfg.bot_poll_seconds < 30:
+        raise ValueError("Paper bot polling interval must be at least 30 seconds")
+    if cfg.bot_scan_interval_seconds < cfg.bot_poll_seconds:
+        raise ValueError("Paper bot scan interval must be at least the polling interval")
+    last_scan_at = None
+    while True:
+        now = perf_counter()
+        try:
+            scan = run_scanner if last_scan_at is None or now - last_scan_at >= cfg.bot_scan_interval_seconds else None
+            if run_paper_bot_cycle(cfg, symbols, top, scan=scan):
+                last_scan_at = perf_counter()
+        except Exception as exc:
+            print(f"Paper bot paused this cycle: {exc}")
+            if once:
+                raise
+        print(f"Paper bot cycle complete at {datetime.now():%Y-%m-%d %H:%M:%S}", flush=True)
+        if once:
+            break
+        sleep(cfg.bot_poll_seconds)
+
+
+@contextmanager
+def bot_lock(path=BOT_LOCK_PATH):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(exist_ok=True)
+    with path.open("r+b") as lock_file:
+        lock_file.seek(0)
+        if sys.platform == "win32":
+            import msvcrt
+
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise ValueError("Another paper bot process is running") from exc
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise ValueError("Another paper bot process is running") from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 def main():
     started_at = perf_counter()
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -180,12 +283,18 @@ def main():
             paper_modes.add_argument("--paper-trade", action="store_true", help="Submit one Alpaca paper bracket order for the top candidate")
             paper_modes.add_argument("--paper-status", action="store_true", help="Inspect Alpaca paper positions and orders without changing them")
             paper_modes.add_argument("--paper-reconcile", action="store_true", help="Inspect paper orders and request cancellation of stale unfilled bot entries")
+            paper_modes.add_argument("--paper-bot", action="store_true", help="Reconcile continuously and rescan for open paper slots")
+            paper_modes.add_argument("--paper-bot-once", action="store_true", help="Run one guarded paper bot cycle and exit")
 
             args = parser.parse_args()
             if args.paper_status or args.paper_reconcile:
                 from swingtrader.paper_trading import report_paper_status
 
                 report_paper_status(cancel_stale=args.paper_reconcile)
+            elif args.paper_bot or args.paper_bot_once:
+                config = build_config(minimum_price=args.min_price, maximum_price=args.max_price)
+                with bot_lock():
+                    run_paper_bot(config, symbols=args.symbols, top=args.top, once=args.paper_bot_once)
             else:
                 config = build_config(
                     minimum_price=args.min_price,

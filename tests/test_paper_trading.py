@@ -1,6 +1,8 @@
 import ast
 import io
+import sqlite3
 import unittest
+from contextlib import closing
 from contextlib import redirect_stdout
 from dataclasses import fields
 from datetime import datetime, timedelta, timezone
@@ -13,10 +15,213 @@ from unittest.mock import Mock, patch
 import main
 from swingtrader.config import TradingConfig, load_trading_config
 from swingtrader.scanner import TradeCandidate
-from swingtrader.paper_trading import load_paper_credentials, plan_paper_order, review_paper_orders
+from swingtrader.paper_trading import bot_attempted_today, bot_capacity, check_bot_daily_halt, load_paper_credentials, plan_paper_order, record_paper_fills, review_paper_orders, submit_paper_candidate
 
 
 class PaperTradingTests(unittest.TestCase):
+    def test_daily_halt_persists_after_equity_recovers(self):
+        now = datetime(2026, 9, 28, 15, 0, tzinfo=timezone.utc)
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "fills.sqlite3"
+            with self.assertRaisesRegex(ValueError, "until next trading day"):
+                check_bot_daily_halt(SimpleNamespace(equity="980", last_equity="1000"), TradingConfig(), now, path)
+            with self.assertRaisesRegex(ValueError, "until next trading day"):
+                check_bot_daily_halt(SimpleNamespace(equity="1010", last_equity="1000"), TradingConfig(), now, path)
+            check_bot_daily_halt(SimpleNamespace(equity="1000", last_equity="1000"),
+                                 TradingConfig(), now + timedelta(days=1), path)
+
+    def test_bot_lock_rejects_second_instance(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "bot.lock"
+            with main.bot_lock(path):
+                with self.assertRaisesRegex(ValueError, "Another paper bot"):
+                    with main.bot_lock(path):
+                        pass
+
+    def test_bot_status_poll_does_not_scan(self):
+        account = SimpleNamespace(equity="1000", last_equity="1000")
+        trading = Mock()
+        trading.get_orders.return_value = []
+        trading.get_account.return_value = account
+        trading.get_all_positions.return_value = []
+        with patch("swingtrader.paper_trading.record_paper_fills", return_value=0), \
+            patch("swingtrader.paper_trading.paper_bot_snapshot", return_value=(trading, [])), \
+            patch("swingtrader.paper_trading.check_bot_daily_halt"), \
+                redirect_stdout(io.StringIO()):
+            self.assertFalse(main.run_paper_bot_cycle(TradingConfig(), scan=None))
+            trading.get_clock.assert_not_called()
+
+    def test_bot_cli_runs_one_cycle_without_scanner_cli_path(self):
+        with TemporaryDirectory() as directory, patch("main.REPORT_DIR", Path(directory)):
+            with patch("main.sys.argv", ["main.py", "--paper-bot-once"]), \
+                    patch("main.run_paper_bot_cycle", return_value=True) as cycle, \
+                    patch("main.run_scanner") as scanner, redirect_stdout(io.StringIO()):
+                main.main()
+        cycle.assert_called_once()
+        scanner.assert_not_called()
+
+    def test_bot_rescans_after_fifteen_minutes(self):
+        with patch("main.perf_counter", side_effect=[0, 1, 301, 902, 903]), \
+                patch("main.run_paper_bot_cycle", side_effect=[True, False, True]) as cycle, \
+                patch("main.sleep", side_effect=[None, None, KeyboardInterrupt]), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                main.run_paper_bot(TradingConfig())
+        self.assertEqual([call.kwargs["scan"] for call in cycle.call_args_list],
+                         [main.run_scanner, None, main.run_scanner])
+
+    def test_closed_or_canceled_symbol_is_not_retried_same_day(self):
+        now = datetime(2026, 9, 28, 15, 0, tzinfo=timezone.utc)
+        order = SimpleNamespace(symbol="TEST", client_order_id="swing-paper-TEST-1",
+                                created_at=now - timedelta(hours=1), status="canceled")
+        self.assertTrue(bot_attempted_today([order], "TEST", now))
+        self.assertFalse(bot_attempted_today([order], "NEXT", now))
+        self.assertFalse(bot_attempted_today([order], "TEST", now + timedelta(days=1)))
+
+        order.id = "old"
+        order.side = "buy"
+        order.type = "limit"
+        order.order_class = "bracket"
+        order.filled_qty = "0"
+        trading = Mock()
+        trading.get_account.return_value = SimpleNamespace(equity="1000", last_equity="1000")
+        trading.get_all_positions.return_value = []
+        trading.get_clock.return_value.is_open = True
+        candidates = [SimpleNamespace(symbol="TEST"), SimpleNamespace(symbol="NEXT")]
+        with patch("swingtrader.paper_trading.paper_bot_snapshot", return_value=(trading, [order])), \
+                patch("swingtrader.paper_trading.record_paper_fills", return_value=0), \
+                patch("swingtrader.paper_trading.check_bot_daily_halt"), \
+                patch("swingtrader.paper_trading.submit_paper_candidate", return_value=SimpleNamespace(
+                    symbol="NEXT", shares=1, limit_price=10.0, stop_price=9.0, target_price=10.12)) as submit, \
+                redirect_stdout(io.StringIO()):
+            self.assertTrue(main.run_paper_bot_cycle(TradingConfig(), scan=Mock(return_value=candidates), now=now))
+        submit.assert_called_once_with(candidates[1], TradingConfig(), execute=True, bot_mode=True)
+
+    def test_fill_ledger_records_buy_and_sell_once(self):
+        now = datetime(2026, 9, 28, 15, 0, tzinfo=timezone.utc)
+        exit_order = SimpleNamespace(id="exit", status="filled", filled_at=now,
+                                     filled_avg_price="10.11", filled_qty="10", side="sell")
+        entry = SimpleNamespace(id="entry", client_order_id="swing-paper-TEST-1", symbol="TEST",
+                                status="filled", filled_at=now - timedelta(days=1),
+                                filled_avg_price="10.00", filled_qty="10", side="buy", legs=[exit_order])
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "fills.sqlite3"
+            self.assertEqual(record_paper_fills([entry], path), 2)
+            self.assertEqual(record_paper_fills([entry], path), 0)
+            with closing(sqlite3.connect(path)) as database:
+                self.assertEqual(database.execute("SELECT side, price FROM fills ORDER BY filled_at").fetchall(),
+                                 [("buy", "10.00"), ("sell", "10.11")])
+
+    def test_bot_capacity_counts_protected_positions_and_daily_loss(self):
+        now = datetime(2026, 9, 28, 15, 0, tzinfo=timezone.utc)
+        account = SimpleNamespace(equity="1000", last_equity="1000")
+        position = SimpleNamespace(symbol="TEST", qty="10", avg_entry_price="10")
+        stop = SimpleNamespace(type="stop", status="new", qty="10", stop_price="9")
+        target = SimpleNamespace(type="limit", status="new")
+        entry = SimpleNamespace(symbol="TEST", client_order_id="swing-paper-TEST-1", status="filled",
+                                filled_at=now - timedelta(days=1), legs=[stop, target], side="buy")
+        capacity = bot_capacity(account, [position], [entry], TradingConfig(), now)
+        self.assertEqual(capacity.slots, 4)
+        self.assertEqual(capacity.remaining_risk, 90.0)
+        with self.assertRaisesRegex(ValueError, "Daily paper loss"):
+            bot_capacity(SimpleNamespace(equity="980", last_equity="1000"), [position], [entry], TradingConfig(), now)
+        stop.status = "canceled"
+        with self.assertRaisesRegex(ValueError, "exits unverified"):
+            bot_capacity(account, [position], [entry], TradingConfig(), now)
+        stop.status = "new"
+        entry.filled_at = now - timedelta(days=85)
+        with self.assertRaisesRegex(ValueError, "GTC expiry"):
+            bot_capacity(account, [position], [entry], TradingConfig(), now)
+
+    def test_bot_capacity_rejects_pending_cancel_and_full_book(self):
+        now = datetime(2026, 9, 28, 15, 0, tzinfo=timezone.utc)
+        account = SimpleNamespace(equity="1000", last_equity="1000")
+        pending = SimpleNamespace(symbol="TEST", client_order_id="swing-paper-TEST-1",
+                                  status="pending_cancel", side="buy")
+        with self.assertRaisesRegex(ValueError, "change pending"):
+            bot_capacity(account, [], [pending], TradingConfig(), now)
+        pending.status = "new"
+        pending.limit_price = "10"
+        pending.qty = "10"
+        pending.filled_qty = "0"
+        pending.legs = [SimpleNamespace(type="stop", stop_price="9")]
+        book = [pending]
+        for index in range(4):
+            book.append(SimpleNamespace(symbol=f"TEST{index}", client_order_id=f"swing-paper-TEST{index}-1",
+                                        status="new", side="buy", limit_price="10", qty="10",
+                                        filled_qty="0", legs=[SimpleNamespace(type="stop", stop_price="9")]))
+        capacity = bot_capacity(account, [], book, TradingConfig(), now)
+        self.assertEqual(capacity.slots, 0)
+        self.assertEqual(capacity.remaining_risk, 50.0)
+
+    def test_bot_cycle_scans_and_submits_with_guard(self):
+        now = datetime(2026, 9, 28, 15, 0, tzinfo=timezone.utc)
+        candidate = SimpleNamespace(symbol="TEST")
+        trading = Mock()
+        trading.get_account.return_value = SimpleNamespace(equity="1000", last_equity="1000")
+        trading.get_all_positions.return_value = []
+        trading.get_clock.return_value.is_open = True
+        scan = Mock(return_value=[candidate])
+        with patch("swingtrader.paper_trading.paper_bot_snapshot", return_value=(trading, [])), \
+                patch("swingtrader.paper_trading.record_paper_fills", return_value=0), \
+            patch("swingtrader.paper_trading.check_bot_daily_halt"), \
+                patch("swingtrader.paper_trading.submit_paper_candidate", return_value=SimpleNamespace(
+                    symbol="TEST", shares=1, limit_price=10.0, stop_price=9.0, target_price=10.11)) as submit, \
+                redirect_stdout(io.StringIO()):
+            self.assertTrue(main.run_paper_bot_cycle(TradingConfig(), scan=scan, now=now))
+        scan.assert_called_once()
+        submit.assert_called_once_with(candidate, TradingConfig(), execute=True, bot_mode=True)
+
+    def test_bot_rechecks_broker_before_submitting(self):
+        candidate = TradeCandidate(
+            symbol="TEST", score=70, prob_gain_10d=0.5, prob_loss_5d=0.2,
+            risk_rating="Medium", entry=10.0, stop=9.0, target_1pct=10.1,
+            target_1=11.5, target_2=13.0, shares=10, risk_dollars=10.0,
+            reward_risk=1.5, main_catalyst="Technical Trend", setup="Momentum", reasons=[],
+        )
+        account = SimpleNamespace(equity="980", last_equity="1000", cash="980", buying_power="980",
+                                  trading_blocked=False)
+        trading = Mock()
+        trading.get_clock.return_value.is_open = True
+        trading.get_account.return_value = account
+        trading.get_all_positions.return_value = []
+        trading.get_orders.return_value = []
+        quote = SimpleNamespace(timestamp=datetime.now(timezone.utc), bid_price=9.99, ask_price=10.0)
+        with patch("swingtrader.paper_trading.load_paper_credentials", return_value=("key", "secret")), \
+                patch("alpaca.trading.client.TradingClient", return_value=trading), \
+            patch("swingtrader.paper_trading.check_bot_daily_halt"), \
+                patch("alpaca.data.historical.StockHistoricalDataClient") as data_client:
+            data_client.return_value.get_stock_latest_quote.return_value = {"TEST": quote}
+            with self.assertRaisesRegex(ValueError, "Daily paper loss"):
+                submit_paper_candidate(candidate, TradingConfig(), execute=True, bot_mode=True)
+        trading.submit_order.assert_not_called()
+
+    def test_bot_does_not_reorder_symbol_after_scan(self):
+        candidate = TradeCandidate(
+            symbol="TEST", score=70, prob_gain_10d=0.5, prob_loss_5d=0.2,
+            risk_rating="Medium", entry=10.0, stop=9.0, target_1pct=10.1,
+            target_1=11.5, target_2=13.0, shares=10, risk_dollars=10.0,
+            reward_risk=1.5, main_catalyst="Technical Trend", setup="Momentum", reasons=[],
+        )
+        trading = Mock()
+        trading.get_clock.return_value.is_open = True
+        trading.get_account.return_value = SimpleNamespace(
+            equity="1000", last_equity="1000", cash="1000", buying_power="1000", trading_blocked=False,
+        )
+        trading.get_all_positions.return_value = []
+        order = SimpleNamespace(symbol="TEST", client_order_id="swing-paper-TEST-1",
+                                created_at=datetime.now(timezone.utc), status="canceled")
+        trading.get_orders.side_effect = [[], [order]]
+        quote = SimpleNamespace(timestamp=datetime.now(timezone.utc), bid_price=9.99, ask_price=10.0)
+        with patch("swingtrader.paper_trading.load_paper_credentials", return_value=("key", "secret")), \
+                patch("swingtrader.paper_trading.check_bot_daily_halt"), \
+                patch("alpaca.trading.client.TradingClient", return_value=trading), \
+                patch("alpaca.data.historical.StockHistoricalDataClient") as data_client:
+            data_client.return_value.get_stock_latest_quote.return_value = {"TEST": quote}
+            with self.assertRaisesRegex(ValueError, "already attempted"):
+                submit_paper_candidate(candidate, TradingConfig(), execute=True, bot_mode=True)
+        trading.submit_order.assert_not_called()
+
     def test_paper_status_does_not_scan_or_submit(self):
         with TemporaryDirectory() as directory, patch("main.REPORT_DIR", Path(directory)):
             with patch("main.sys.argv", ["main.py", "--paper-status"]), \
@@ -128,6 +333,35 @@ class PaperTradingTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "spread"):
             plan_paper_order(candidate, bid=9.50, ask=10.50, cfg=TradingConfig())
+
+    def test_default_spread_limit_preserves_small_target(self):
+        candidate = TradeCandidate(
+            symbol="TEST", score=70, prob_gain_10d=0.5, prob_loss_5d=0.2,
+            risk_rating="Medium", entry=10.0, stop=9.0, target_1pct=10.1,
+            target_1=11.5, target_2=13.0, shares=10, risk_dollars=10.0,
+            reward_risk=1.5, main_catalyst="Technical Trend", setup="Momentum",
+            reasons=[],
+        )
+
+        with self.assertRaisesRegex(ValueError, "spread"):
+            plan_paper_order(candidate, bid=9.97, ask=10.00, cfg=TradingConfig())
+        self.assertEqual(plan_paper_order(candidate, bid=9.99, ask=10.00, cfg=TradingConfig()).symbol, "TEST")
+
+    def test_paper_take_profit_uses_configured_target_and_cost_allowance(self):
+        candidate = TradeCandidate(
+            symbol="TEST", score=70, prob_gain_10d=0.5, prob_loss_5d=0.2,
+            risk_rating="Medium", entry=10.0, stop=9.0, target_1pct=10.1,
+            target_1=11.5, target_2=13.0, shares=10, risk_dollars=10.0,
+            reward_risk=1.5, main_catalyst="Technical Trend", setup="Momentum",
+            reasons=[],
+        )
+
+        plan = plan_paper_order(candidate, bid=9.99, ask=10.0, cfg=TradingConfig())
+        self.assertEqual(plan.target_price, 10.12)
+        self.assertGreaterEqual(plan.target_price * (1 - TradingConfig().estimated_exit_cost_fraction) / plan.limit_price - 1, 0.01)
+        custom = plan_paper_order(candidate, bid=9.99, ask=10.0,
+                                  cfg=TradingConfig(target_percent=2.0, estimated_exit_cost_fraction=0.002))
+        self.assertEqual(custom.target_price, 10.23)
 
 
 if __name__ == "__main__":
