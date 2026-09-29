@@ -53,8 +53,11 @@ prove broker execution, and stops cannot guarantee the planned loss.
 ## Paper Bot (Experimental)
 
 After verifying the one-shot paper workflow in Alpaca, start the paper-only bot
-from the project directory with `python main.py --paper-bot`. Keep the process
-running; stop it with Ctrl+C. `python main.py --paper-bot-once` performs one cycle
+from the project directory on Windows with
+`.\.venv\Scripts\python.exe main.py --paper-bot`. Use that explicit interpreter
+if your terminal has not activated the virtual environment; a plain `python` may
+point to another installation without `alpaca-py`. Keep the process running;
+stop it with Ctrl+C. `.\.venv\Scripts\python.exe main.py --paper-bot-once` performs one cycle
 and exits (it **can place paper orders**). Both modes require paper credentials.
 Only one bot instance can run at a time. Outside regular US market hours the bot
 reconciles broker state but does not place entries. Between 10:00 and 15:30 New

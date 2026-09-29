@@ -1,4 +1,5 @@
 import argparse
+import importlib.util
 import json
 import sys
 from contextlib import contextmanager, redirect_stdout
@@ -184,7 +185,7 @@ def run_paper_bot_cycle(cfg, symbols=None, top=25, *, scan=run_scanner, now=None
     if scan is None:
         return False
     local_time = now.astimezone(ZoneInfo("America/New_York"))
-    if not trading.get_clock().is_open or not (10, 0) <= (local_time.hour, local_time.minute) < (15, 30):
+    if not getattr(trading.get_clock(), "is_open", False) or not (10, 0) <= (local_time.hour, local_time.minute) < (15, 30):
         return False
     if capacity.slots <= 0 or capacity.remaining_risk <= 0:
         print("Paper bot at position or planned-risk limit")
@@ -204,6 +205,10 @@ def run_paper_bot_cycle(cfg, symbols=None, top=25, *, scan=run_scanner, now=None
 
 
 def run_paper_bot(cfg, symbols=None, top=25, *, once=False):
+    if importlib.util.find_spec("alpaca") is None:
+        raise RuntimeError(
+            f"alpaca-py is not installed in {sys.executable}; run the bot with .\\.venv\\Scripts\\python.exe"
+        )
     if cfg.bot_poll_seconds < 30:
         raise ValueError("Paper bot polling interval must be at least 30 seconds")
     if cfg.bot_scan_interval_seconds < cfg.bot_poll_seconds:

@@ -19,6 +19,13 @@ from swingtrader.paper_trading import bot_attempted_today, bot_capacity, check_b
 
 
 class PaperTradingTests(unittest.TestCase):
+    def test_bot_reports_missing_alpaca_before_loop(self):
+        with patch("main.importlib.util.find_spec", return_value=None), \
+                patch("main.run_paper_bot_cycle") as cycle:
+            with self.assertRaisesRegex(RuntimeError, "not installed in .*python"):
+                main.run_paper_bot(TradingConfig())
+        cycle.assert_not_called()
+
     def test_daily_halt_persists_after_equity_recovers(self):
         now = datetime(2026, 9, 28, 15, 0, tzinfo=timezone.utc)
         with TemporaryDirectory() as directory:
