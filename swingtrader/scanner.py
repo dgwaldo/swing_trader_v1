@@ -91,6 +91,7 @@ def analyze(
     raw: pd.DataFrame,
     cfg: TradingConfig,
     current_price: float | None = None,
+    sentiment_fn=get_sentiment,
 ) -> TradeCandidate | None:
     if raw.empty:
         return None
@@ -169,7 +170,7 @@ def analyze(
         return None
 
     # 5. News Sentiment & Catalyst Extraction
-    sentiment = get_sentiment(symbol)
+    sentiment = sentiment_fn(symbol)
     if sentiment.article_count:
         if sentiment.score >= cfg.sentiment_positive_threshold:
             score += cfg.sentiment_bonus_score

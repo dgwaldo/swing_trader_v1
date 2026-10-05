@@ -2,7 +2,7 @@ import ast
 import io
 import sqlite3
 import unittest
-from contextlib import closing
+from contextlib import closing, nullcontext
 from contextlib import redirect_stdout
 from dataclasses import fields
 from datetime import datetime, timedelta, timezone
@@ -61,6 +61,7 @@ class PaperTradingTests(unittest.TestCase):
     def test_bot_cli_runs_one_cycle_without_scanner_cli_path(self):
         with TemporaryDirectory() as directory, patch("main.REPORT_DIR", Path(directory)):
             with patch("main.sys.argv", ["main.py", "--paper-bot-once"]), \
+                    patch("main.bot_lock", return_value=nullcontext()), \
                     patch("main.run_paper_bot_cycle", return_value=True) as cycle, \
                     patch("main.run_scanner") as scanner, redirect_stdout(io.StringIO()):
                 main.main()
@@ -130,6 +131,8 @@ class PaperTradingTests(unittest.TestCase):
         capacity = bot_capacity(account, [position], [entry], TradingConfig(), now)
         self.assertEqual(capacity.slots, 4)
         self.assertEqual(capacity.remaining_risk, 90.0)
+        stop.status = "held"
+        self.assertEqual(bot_capacity(account, [position], [entry], TradingConfig(), now).remaining_risk, 90.0)
         with self.assertRaisesRegex(ValueError, "Daily paper loss"):
             bot_capacity(SimpleNamespace(equity="980", last_equity="1000"), [position], [entry], TradingConfig(), now)
         stop.status = "canceled"

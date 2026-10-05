@@ -230,6 +230,41 @@ def run_paper_bot(cfg, symbols=None, top=25, *, once=False):
         sleep(cfg.bot_poll_seconds)
 
 
+def run_backtest_cli(symbols, start, end, cfg, *, slippage_bps=5.0):
+    from swingtrader.backtest import (
+        AlpacaMarketDataProvider,
+        format_backtest_report,
+        run_backtest,
+    )
+    from swingtrader.paper_trading import load_paper_credentials
+
+    if not symbols:
+        raise ValueError("Backtests require explicit --symbols to make the tested universe reproducible")
+    key, secret = load_paper_credentials()
+    provider = AlpacaMarketDataProvider(key, secret)
+    histories = provider.get_bars([*symbols, "SPY"], start, end)
+    benchmark = histories.pop("SPY", None)
+    missing = sorted(set(symbols) - histories.keys())
+    if missing:
+        print(f"No Alpaca daily bars returned for: {', '.join(missing)}")
+    if not histories:
+        raise ValueError("Alpaca returned no history for the requested symbols")
+    result = run_backtest(histories, cfg, slippage_bps=slippage_bps, benchmark=benchmark)
+    report = format_backtest_report(
+        result,
+        symbols=list(histories),
+        start=start,
+        end=end,
+        slippage_bps=slippage_bps,
+    )
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+    report_path = REPORT_DIR / f"backtest_{timestamp}.md"
+    report_path.write_text(report, encoding="utf-8")
+    print(report, end="")
+    print(f"Saved backtest report to {report_path}")
+    return result
+
+
 @contextmanager
 def bot_lock(path=BOT_LOCK_PATH):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -283,6 +318,10 @@ def main():
             parser.add_argument("--top", type=int, default=25, help="Number of top candidates to return (default 25)")
             parser.add_argument("--min-price", type=float, help="Minimum stock price (default $5.00)")
             parser.add_argument("--max-price", type=float, help="Maximum stock price (default $30.00)")
+            parser.add_argument("--backtest", action="store_true", help="Run a historical daily-bar backtest")
+            parser.add_argument("--start", help="Backtest start date (YYYY-MM-DD)")
+            parser.add_argument("--end", help="Backtest end date (YYYY-MM-DD)")
+            parser.add_argument("--slippage-bps", type=float, default=5.0, help="Slippage per fill in basis points")
             paper_modes = parser.add_mutually_exclusive_group()
             paper_modes.add_argument("--paper-preview", action="store_true", help="Check top candidate against Alpaca paper quotes without placing an order")
             paper_modes.add_argument("--paper-trade", action="store_true", help="Submit one Alpaca paper bracket order for the top candidate")
@@ -292,7 +331,14 @@ def main():
             paper_modes.add_argument("--paper-bot-once", action="store_true", help="Run one guarded paper bot cycle and exit")
 
             args = parser.parse_args()
-            if args.paper_status or args.paper_reconcile:
+            if args.backtest:
+                if not args.start or not args.end:
+                    parser.error("--backtest requires both --start and --end")
+                if date.fromisoformat(args.start) > date.fromisoformat(args.end):
+                    parser.error("--start must not be later than --end")
+                config = build_config(minimum_price=args.min_price, maximum_price=args.max_price)
+                run_backtest_cli(args.symbols, args.start, args.end, config, slippage_bps=args.slippage_bps)
+            elif args.paper_status or args.paper_reconcile:
                 from swingtrader.paper_trading import report_paper_status
 
                 report_paper_status(cancel_stale=args.paper_reconcile)

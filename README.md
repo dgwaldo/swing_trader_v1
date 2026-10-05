@@ -126,6 +126,30 @@ Technical signals remain based on completed daily candles. After qualification,
 candidate entries, stops, targets, and share counts are refreshed in batches using
 the latest available one-minute trade, including pre-market and after-hours bars.
 
+## Historical Backtest (Initial Baseline)
+
+The first event-driven baseline uses Alpaca split-adjusted IEX daily bars and the
+existing technical candidate logic. Specify the tested symbols and date range; the
+run saves a Markdown trade ledger and summary under `data/scans`:
+
+```powershell
+python main.py --backtest --symbols AAPL MSFT NVDA --start 2023-01-01 --end 2025-01-01
+```
+
+Backtest market data uses the Alpaca credentials in the ignored root `config.py`.
+Signals are evaluated after each completed close, entries occur no earlier than
+the next session's open, and stop gaps fill at the open with configured slippage.
+When a daily candle touches both stop and target, the simulator assumes the stop
+happened first. Targets fill at their limit price when touched. Slippage defaults
+to 5 basis points per fill and can be changed with `--slippage-bps`; commissions
+are currently zero. The report compares price return against SPY.
+
+This is a first baseline, not yet a full validation framework: historical news is
+disabled, the explicit symbol list does not reconstruct historical constituents,
+survivorship bias remains, and portfolio allocation/report metrics are limited.
+The existing strategy's feature calculations are called on bars ending at each
+signal date, preventing later bars from entering earlier decisions.
+
 ## Sentiment & Catalyst Classification
 
 For candidates that pass the technical rules, the scanner fetches headlines within the last 72 hours and scores them with VADER. It also classifies the primary catalyst (e.g. Earnings/Guidance, Analyst Action, Insider/Institutional Flow, Corporate Events). Clearly positive news adds 5 points to the candidate score; clearly negative news subtracts 10 points.

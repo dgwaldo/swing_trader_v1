@@ -99,7 +99,7 @@ def bot_capacity(account, positions, orders, cfg: TradingConfig, now: datetime) 
             raise ValueError(f"{position.symbol}: paper exits are nearing GTC expiry; manual review required")
         legs = entry.legs or []
         stop_legs = [leg for leg in legs if getattr(leg.type, "value", leg.type) == "stop"
-                     and getattr(leg.status, "value", leg.status) in active]
+                     and getattr(leg.status, "value", leg.status) in active | {"held"}]
         profit_legs = [leg for leg in legs if getattr(leg.type, "value", leg.type) == "limit"
                        and getattr(leg.status, "value", leg.status) in active]
         if len(stop_legs) != 1 or len(profit_legs) != 1 or float(stop_legs[0].qty) < float(position.qty):
