@@ -7,6 +7,10 @@ from .indicators import add_indicators, detect_patterns, calculate_forward_proba
 from .sentiment import get_sentiment
 
 
+STRATEGY_ID = "current_swing_trader_v1"
+STRATEGY_VERSION = "1.0.0"
+
+
 @dataclass
 class TradeCandidate:
     symbol: str

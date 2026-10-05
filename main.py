@@ -1,6 +1,7 @@
 import argparse
 import importlib.util
 import json
+import math
 import sys
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import asdict, replace
@@ -237,41 +238,80 @@ def run_backtest_cli(
     cfg,
     *,
     slippage_bps=5.0,
+    spread_bps=5.0,
+    spread_scenarios_bps=None,
+    commission_per_share=0.0,
     target_fill_mode="trade_through",
     target_trade_through_bps=5.0,
 ):
     from swingtrader.backtest import (
         AlpacaMarketDataProvider,
-        format_backtest_report,
+        SECTOR_BY_SYMBOL,
+        SECTOR_ETF_BY_SECTOR,
+        format_spread_sensitivity_report,
         run_backtest,
     )
+    from swingtrader.backtest_store import DEFAULT_BACKTEST_DB, persist_sensitivity_results
     from swingtrader.paper_trading import load_paper_credentials
 
     if not symbols:
         raise ValueError("Backtests require explicit --symbols to make the tested universe reproducible")
     key, secret = load_paper_credentials()
     provider = AlpacaMarketDataProvider(key, secret)
-    histories = provider.get_bars([*symbols, "SPY"], start, end)
+    sectors = {SECTOR_BY_SYMBOL[symbol] for symbol in symbols if symbol in SECTOR_BY_SYMBOL}
+    sector_etfs = sorted({
+        SECTOR_ETF_BY_SECTOR[sector]
+        for sector in sectors
+        if sector in SECTOR_ETF_BY_SECTOR
+    })
+    requested_symbols = list(dict.fromkeys([*symbols, "SPY", *sector_etfs]))
+    histories = provider.get_bars(requested_symbols, start, end)
     benchmark = histories.pop("SPY", None)
+    sector_benchmarks = {etf: histories.pop(etf, None) for etf in sector_etfs}
+    sector_benchmarks = {etf: bars for etf, bars in sector_benchmarks.items() if bars is not None}
     missing = sorted(set(symbols) - histories.keys())
     if missing:
         print(f"No Alpaca daily bars returned for: {', '.join(missing)}")
     if not histories:
         raise ValueError("Alpaca returned no history for the requested symbols")
-    result = run_backtest(
-        histories,
-        cfg,
-        slippage_bps=slippage_bps,
-        target_fill_mode=target_fill_mode,
-        target_trade_through_bps=target_trade_through_bps,
-        benchmark=benchmark,
-    )
-    report = format_backtest_report(
-        result,
+    spread_scenarios = [spread_bps] if spread_scenarios_bps is None else spread_scenarios_bps
+    if not spread_scenarios or any(not math.isfinite(value) or value < 0 for value in spread_scenarios):
+        raise ValueError("Spread scenarios must contain non-negative basis-point values")
+    strategy_cache = {}
+    results = [
+        (scenario_spread, run_backtest(
+            histories,
+            cfg,
+            slippage_bps=slippage_bps,
+            spread_bps=scenario_spread,
+            commission_per_share=commission_per_share,
+            target_fill_mode=target_fill_mode,
+            target_trade_through_bps=target_trade_through_bps,
+            strategy_cache=strategy_cache,
+            benchmark=benchmark,
+            sector_benchmarks=sector_benchmarks,
+        ))
+        for scenario_spread in spread_scenarios
+    ]
+    run_ids = persist_sensitivity_results(
+        results,
         symbols=list(histories),
         start=start,
         end=end,
         slippage_bps=slippage_bps,
+        commission_per_share=commission_per_share,
+        target_fill_mode=target_fill_mode,
+        target_trade_through_bps=target_trade_through_bps,
+    )
+    report = format_spread_sensitivity_report(
+        results,
+        run_ids=run_ids,
+        database_path=str(DEFAULT_BACKTEST_DB),
+        symbols=list(histories),
+        start=start,
+        end=end,
+        slippage_bps=slippage_bps,
+        commission_per_share=commission_per_share,
         target_fill_mode=target_fill_mode,
         target_trade_through_bps=target_trade_through_bps,
     )
@@ -279,8 +319,9 @@ def run_backtest_cli(
     report_path = REPORT_DIR / f"backtest_{timestamp}.md"
     report_path.write_text(report, encoding="utf-8")
     print(report, end="")
+    print(f"Persisted {len(run_ids)} run(s) to {DEFAULT_BACKTEST_DB}")
     print(f"Saved backtest report to {report_path}")
-    return result
+    return results
 
 
 @contextmanager
@@ -340,6 +381,19 @@ def main():
             parser.add_argument("--start", help="Backtest start date (YYYY-MM-DD)")
             parser.add_argument("--end", help="Backtest end date (YYYY-MM-DD)")
             parser.add_argument("--slippage-bps", type=float, default=5.0, help="Slippage per fill in basis points")
+            parser.add_argument("--spread-bps", type=float, default=5.0, help="Full bid-ask spread in basis points")
+            parser.add_argument(
+                "--spread-scenarios-bps",
+                nargs="+",
+                type=float,
+                help="Run multiple full-spread scenarios against the same downloaded bars",
+            )
+            parser.add_argument(
+                "--commission-per-share",
+                type=float,
+                default=0.0,
+                help="Commission charged per share on each side of a trade",
+            )
             parser.add_argument(
                 "--target-fill-mode",
                 choices=("touch", "trade_through"),
@@ -373,6 +427,9 @@ def main():
                     args.end,
                     config,
                     slippage_bps=args.slippage_bps,
+                    spread_bps=args.spread_bps,
+                    spread_scenarios_bps=args.spread_scenarios_bps,
+                    commission_per_share=args.commission_per_share,
                     target_fill_mode=args.target_fill_mode,
                     target_trade_through_bps=args.target_trade_through_bps,
                 )

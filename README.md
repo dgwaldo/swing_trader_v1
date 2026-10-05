@@ -130,28 +130,78 @@ the latest available one-minute trade, including pre-market and after-hours bars
 
 The first event-driven baseline uses Alpaca split-adjusted IEX daily bars and the
 existing technical candidate logic. Specify the tested symbols and date range; the
-run saves a Markdown trade ledger and summary under `data/scans`:
+run saves a Markdown report under `data/scans` and persists each spread scenario to
+`data/backtests.sqlite3`:
 
 ```powershell
-python main.py --backtest --symbols AAPL MSFT NVDA --start 2023-01-01 --end 2025-01-01
+python main.py --backtest --symbols AAPL MSFT NVDA --start 2023-01-01 --end 2025-01-01 `
+    --slippage-bps 5 --spread-scenarios-bps 0 5 10 25 --commission-per-share 0.005
 ```
 
 Backtest market data uses the Alpaca credentials in the ignored root `config.py`.
 Signals are evaluated after each completed close, entries occur no earlier than
 the next session's open, and stop gaps fill at the open with configured slippage.
 When a daily candle touches both stop and target, the simulator assumes the stop
-happened first. Target limit orders default to requiring a 5-basis-point
-trade-through before assuming a fill; `--target-fill-mode touch` runs the more
-optimistic touch assumption, and `--target-trade-through-bps` changes the
-threshold. Target fills are recorded at the limit price. Slippage defaults to 5
-basis points per fill and can be changed with `--slippage-bps`; commissions are
-currently zero. The report compares price return against SPY.
+happened first. `--spread-bps` models the full quoted spread, applying half on
+each market-side fill. Target limit orders default to requiring a 5-basis-point
+trade-through plus half the spread before assuming a fill; target fills remain at
+the limit price. `--target-fill-mode touch` runs the more optimistic touch
+assumption. `--spread-scenarios-bps` compares multiple spread assumptions using
+the same downloaded bars. Slippage defaults to 5 basis points per market-side
+fill; `--commission-per-share` is charged on both entry and exit (default $0).
+The report compares price return against SPY.
+The SQLite database has `backtest_runs`, `backtest_trades`, and `backtest_equity`
+tables. Each report row contains the corresponding run ID, making it possible to
+retrieve the exact run and its ledger; the existing paper-fill database is separate.
 
 This is a first baseline, not yet a full validation framework: historical news is
 disabled, the explicit symbol list does not reconstruct historical constituents,
-survivorship bias remains, and portfolio allocation/report metrics are limited.
+survivorship bias remains, and shared capital allocation, sector, and correlation
+risk are not yet modeled.
 The existing strategy's feature calculations are called on bars ending at each
 signal date, preventing later bars from entering earlier decisions.
+
+### Recorded Baseline (2026-10-05)
+
+Basket: `F BAC SOFI SNAP PLTR INTC PFE CCL NU RIVN`, 2021-01-01 through
+2025-12-31. The 1% target exit was held fixed. All scenarios used 5 bps slippage
+per market-side fill and $0.005/share commission per side; only full-spread
+assumption varied:
+
+| Full spread | Ending equity | Return | Max drawdown | Trades | Win rate | Avg R | Profit factor |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 bps | $675.33 | -32.47% | -33.23% | 1,260 | 82.54% | -0.04 | 0.76 |
+| 5 bps | $599.51 | -40.05% | -40.34% | 1,232 | 81.66% | -0.06 | 0.70 |
+| 10 bps | $595.18 | -40.48% | -40.71% | 1,226 | 81.65% | -0.06 | 0.70 |
+| 25 bps | $496.98 | -50.30% | -50.55% | 1,177 | 79.86% | -0.08 | 0.61 |
+
+SPY price return over the same period was +81.67%. These figures are a
+survivor-biased sample, not evidence of general strategy performance; no
+historical constituents or headlines were used. See the complete assumptions and
+ledger in [the sensitivity report](data/scans/backtest_2026-10-05_10-06-18_173797.md).
+New sensitivity reports include a strategy ID/version, a SHA-256 fingerprint,
+and the exact trading configuration snapshot. They also include CAGR, simple
+return difference versus SPY, annualized volatility and risk ratios (252 sessions
+per year, zero risk-free rate), trade win/loss distributions, net expectancy,
+loss streak, average holding sessions, gross exposure, and turnover. Exposure is
+daily gross position value divided by marked equity, averaged over the test;
+turnover is total entry-plus-exit notional divided by average daily equity (not
+annualized). CAGR uses elapsed calendar days; benchmark difference is not
+beta-adjusted alpha. Trades are grouped by SPY regime at the signal close: BULL
+uses close > SMA50 > SMA200, BEAR uses close < SMA50 < SMA200, HIGH_VOLATILITY
+uses annualized 20-session realized volatility >= 30%, and other fully observed
+dates are NEUTRAL. Insufficient SPY history is UNKNOWN. Regimes are descriptive
+only and never filter trades. Increment the strategy version in
+`swingtrader/scanner.py` whenever the strategy rules change.
+Reports also break down average/peak portfolio exposure by sector and summarize
+pairwise correlations among open positions. Correlations use up to 60 daily
+returns through each session close and require 20 common observations. The sector
+map is explicit and present-day, not a point-in-time industry database; correlation
+and sector outputs are descriptive only and do not alter position sizing.
+Each trade also records its 20-session stock return, SPY return, mapped sector ETF
+return, and stock-minus-benchmark relative strength at the signal close. ETF history
+that is unavailable or too short is reported as `N/A`; no future values are filled
+in, and these measurements do not change candidate ranking or execution.
 
 ## Sentiment & Catalyst Classification
 

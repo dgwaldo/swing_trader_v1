@@ -1293,6 +1293,19 @@ Only after successful paper validation:
 - Continue recording all strategy state
 - Compare live vs backtest vs paper performance
 
+## Progress Record (2026-10-05)
+
+- Phase 1 initial baseline: the current technical candidate rules run through an event-driven daily-bar backtester with date-bounded strategy inputs, next-session-open entries, and gap-aware stops.
+- Phase 2 initial execution assumptions: 5 bps slippage, configurable full spread, configurable per-share commissions, conservative target trade-through, and stop-first resolution for daily bars touching both exit levels.
+- The 2021-01-01 to 2025-12-31 test of `F BAC SOFI SNAP PLTR INTC PFE CCL NU RIVN` lost money at every tested spread assumption and materially lagged SPY. The high win rate did not imply positive expectancy.
+- Full cost table, ledger, and assumptions: [data/scans/backtest_2026-10-05_10-06-18_173797.md](data/scans/backtest_2026-10-05_10-06-18_173797.md).
+- Backtests now record strategy ID/version and a SHA-256 hash plus exact JSON snapshot of `TradingConfig`; increment the strategy version manually when rules change.
+- Standard reports now include annualized return/risk ratios, benchmark return difference, trade win/loss distributions, expectancy, loss streak, holding sessions, gross exposure, turnover, descriptive SPY regime performance, sector exposure, open-position correlation, and signal-time relative strength versus SPY/sector ETF.
+- Backtest runs, normalized trade ledgers, daily equity points, regime summaries, sector aggregates, correlation summaries, and relative-strength observations now persist in a dedicated SQLite database; sensitivity report rows carry their run IDs.
+- Limitations remain: survivorship-biased explicit symbol basket, no historical sentiment, daily-bar fill ambiguity, manual non-point-in-time sector assignments, and no sector/correlation-aware capital allocation.
+- The experiment runner is deferred; strategy/config identity remains recorded to preserve reproducibility.
+- Next: unify scanner and backtest market-data provider boundaries while preserving the current signal behavior.
+
 ---
 
 # 32. Definition of "Good Enough"

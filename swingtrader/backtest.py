@@ -1,12 +1,40 @@
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, time, timezone
+import hashlib
+import json
 from typing import Callable, Protocol
 
 import numpy as np
 import pandas as pd
 
 from .config import TradingConfig
-from .scanner import TradeCandidate, evaluate_candidate, refresh_candidate_price
+from .scanner import (
+    STRATEGY_ID,
+    STRATEGY_VERSION,
+    TradeCandidate,
+    evaluate_candidate,
+    refresh_candidate_price,
+)
+
+SECTOR_BY_SYMBOL = {
+    "F": "Consumer Discretionary",
+    "CCL": "Consumer Discretionary",
+    "RIVN": "Consumer Discretionary",
+    "BAC": "Financials",
+    "SOFI": "Financials",
+    "NU": "Financials",
+    "SNAP": "Communication Services",
+    "PLTR": "Information Technology",
+    "INTC": "Information Technology",
+    "PFE": "Health Care",
+}
+SECTOR_ETF_BY_SECTOR = {
+    "Consumer Discretionary": "XLY",
+    "Financials": "XLF",
+    "Communication Services": "XLC",
+    "Information Technology": "XLK",
+    "Health Care": "XLV",
+}
 
 
 class MarketDataProvider(Protocol):
@@ -48,12 +76,24 @@ class AlpacaMarketDataProvider:
 
 @dataclass
 class BacktestTrade:
+    strategy_id: str
+    strategy_version: str
+    configuration_hash: str
     symbol: str
+    sector: str
+    sector_etf: str | None
+    market_regime: str
+    stock_return_20d: float | None
+    market_return_20d: float | None
+    sector_return_20d: float | None
+    relative_strength_vs_market: float | None
+    relative_strength_vs_sector: float | None
     entry_date: str
     exit_date: str
     entry_price: float
     exit_price: float
     shares: int
+    holding_sessions: int
     stop_price: float
     target_price: float
     exit_reason: str
@@ -74,6 +114,33 @@ class BacktestResult:
     win_rate: float
     average_r: float
     profit_factor: float
+    strategy_id: str
+    strategy_version: str
+    configuration_hash: str
+    configuration: dict
+    cagr: float | None
+    benchmark_alpha: float | None
+    annualized_volatility: float
+    sharpe_ratio: float | None
+    sortino_ratio: float | None
+    calmar_ratio: float | None
+    average_win: float | None
+    average_loss: float | None
+    median_win: float | None
+    median_loss: float | None
+    expectancy_dollars: float
+    max_consecutive_losses: int
+    average_holding_sessions: float
+    average_gross_exposure: float
+    turnover: float
+    market_regime_metrics: dict[str, dict[str, float | int]]
+    sector_mapping: dict[str, str]
+    sector_etf_mapping: dict[str, str]
+    sector_exposure_metrics: dict[str, dict[str, float]]
+    average_pairwise_correlation: float | None
+    max_pairwise_correlation: float | None
+    average_relative_strength_vs_market: float | None
+    average_relative_strength_vs_sector: float | None
 
 
 @dataclass
@@ -85,10 +152,36 @@ class _Position:
     stop_price: float
     target_price: float
     initial_risk: float
+    sector: str
+    sector_etf: str | None
+    market_regime: str
+    stock_return_20d: float | None
+    market_return_20d: float | None
+    sector_return_20d: float | None
+    relative_strength_vs_market: float | None
+    relative_strength_vs_sector: float | None
+
+
+@dataclass
+class _Signal:
+    candidate: TradeCandidate
+    market_regime: str
+    sector: str
+    sector_etf: str | None
+    stock_return_20d: float | None
+    market_return_20d: float | None
+    sector_return_20d: float | None
+    relative_strength_vs_market: float | None
+    relative_strength_vs_sector: float | None
 
 
 def _historical_strategy(symbol: str, bars: pd.DataFrame, cfg: TradingConfig):
     return evaluate_candidate(symbol, bars, cfg)
+
+
+def configuration_hash(cfg: TradingConfig) -> str:
+    payload = json.dumps(asdict(cfg), sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _normalize_bars(bars: pd.DataFrame) -> pd.DataFrame:
@@ -100,19 +193,64 @@ def _normalize_bars(bars: pd.DataFrame) -> pd.DataFrame:
     return data.loc[~data.index.duplicated(keep="last")].sort_index()
 
 
+def _market_regimes(benchmark: pd.DataFrame | None) -> dict[pd.Timestamp, str]:
+    if benchmark is None or benchmark.empty:
+        return {}
+
+    bars = _normalize_bars(benchmark)
+    close = bars["Close"]
+    sma50 = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    annualized_volatility = close.pct_change().rolling(20).std() * np.sqrt(252)
+    regimes = {}
+    for day, price, trend50, trend200, volatility in zip(
+        bars.index, close, sma50, sma200, annualized_volatility,
+    ):
+        if pd.isna(trend50) or pd.isna(trend200) or pd.isna(volatility):
+            regime = "UNKNOWN"
+        elif volatility >= 0.30:
+            regime = "HIGH_VOLATILITY"
+        elif price > trend50 > trend200:
+            regime = "BULL"
+        elif price < trend50 < trend200:
+            regime = "BEAR"
+        else:
+            regime = "NEUTRAL"
+        regimes[day] = regime
+    return regimes
+
+
+def _value_at(series: pd.Series | None, day: pd.Timestamp) -> float | None:
+    if series is None:
+        return None
+    value = series.get(day)
+    return None if value is None or pd.isna(value) else float(value)
+
+
+def _format_percent(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:.2%}"
+
+
 def run_backtest(
     histories: dict[str, pd.DataFrame],
     cfg: TradingConfig,
     *,
     slippage_bps: float = 5.0,
+    spread_bps: float = 0.0,
     commission_per_share: float = 0.0,
     target_fill_mode: str = "trade_through",
     target_trade_through_bps: float = 5.0,
     strategy: Callable[[str, pd.DataFrame, TradingConfig], TradeCandidate | None] = _historical_strategy,
+    strategy_cache: dict[tuple[str, str, pd.Timestamp], TradeCandidate | None] | None = None,
+    strategy_id: str = STRATEGY_ID,
+    strategy_version: str = STRATEGY_VERSION,
     benchmark: pd.DataFrame | None = None,
+    sector_map: dict[str, str] | None = None,
+    sector_benchmarks: dict[str, pd.DataFrame] | None = None,
 ) -> BacktestResult:
     """Run close-generated signals at the following session's open using daily bars."""
-    if slippage_bps < 0 or commission_per_share < 0 or target_trade_through_bps < 0:
+    costs = (slippage_bps, spread_bps, commission_per_share, target_trade_through_bps)
+    if any(not np.isfinite(cost) or cost < 0 for cost in costs):
         raise ValueError("Execution costs cannot be negative")
     if target_fill_mode not in {"touch", "trade_through"}:
         raise ValueError("Target fill mode must be 'touch' or 'trade_through'")
@@ -122,32 +260,74 @@ def run_backtest(
     if not sessions:
         raise ValueError("No historical bars available for the requested backtest")
 
-    slip = slippage_bps / 10_000
+    market_cost = (slippage_bps + spread_bps / 2) / 10_000
+    config_fingerprint = configuration_hash(cfg)
+    market_regimes = _market_regimes(benchmark)
+    sectors = {
+        symbol: SECTOR_BY_SYMBOL.get(symbol, "Unclassified")
+        for symbol in data
+    }
+    if sector_map:
+        sectors.update({symbol: sector_map.get(symbol, sectors[symbol]) for symbol in data})
+    sector_etfs = {
+        sector: SECTOR_ETF_BY_SECTOR[sector]
+        for sector in set(sectors.values())
+        if sector in SECTOR_ETF_BY_SECTOR
+    }
+    tracked_sectors = sorted(set(sectors.values()))
+    daily_returns = {symbol: bars["Close"].pct_change() for symbol, bars in data.items()}
+    stock_returns_20d = {symbol: bars["Close"].pct_change(20) for symbol, bars in data.items()}
+    benchmark_bars = _normalize_bars(benchmark) if benchmark is not None and not benchmark.empty else None
+    market_returns_20d = benchmark_bars["Close"].pct_change(20) if benchmark_bars is not None else None
+    sector_returns_20d = {
+        etf: _normalize_bars((sector_benchmarks or {})[etf])["Close"].pct_change(20)
+        for etf in set(sector_etfs.values())
+        if etf in (sector_benchmarks or {}) and not (sector_benchmarks or {})[etf].empty
+    }
     cash = cfg.account_size
     positions: dict[str, _Position] = {}
-    pending: list[TradeCandidate] = []
+    strategy_cache = {} if strategy_cache is None else strategy_cache
+    pending: list[_Signal] = []
     trades: list[BacktestTrade] = []
     equity_values: list[float] = []
     equity_dates: list[pd.Timestamp] = []
+    exposure_fractions: list[float] = []
+    sector_exposure_fractions = {sector: [] for sector in tracked_sectors}
+    daily_pairwise_correlations: list[float] = []
+    maximum_pairwise_correlations: list[float] = []
     last_closes: dict[str, tuple[pd.Timestamp, float]] = {}
 
     def close_position(symbol: str, position: _Position, day: pd.Timestamp, price: float, reason: str):
         nonlocal cash
         exit_price = price
         if reason.startswith("stop") or reason == "end_of_test":
-            exit_price *= 1 - slip
+            exit_price *= 1 - market_cost
+        elif reason == "target_gap":
+            exit_price = max(position.target_price, exit_price * (1 - market_cost))
         pnl = (exit_price - position.entry_price) * position.shares
         fees = commission_per_share * position.shares * 2
         pnl -= fees
         cash += exit_price * position.shares - commission_per_share * position.shares
         realized_r = pnl / position.initial_risk if position.initial_risk else 0.0
         trades.append(BacktestTrade(
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+            configuration_hash=config_fingerprint,
             symbol=symbol,
+            sector=position.sector,
+            sector_etf=position.sector_etf,
+            market_regime=position.market_regime,
+            stock_return_20d=position.stock_return_20d,
+            market_return_20d=position.market_return_20d,
+            sector_return_20d=position.sector_return_20d,
+            relative_strength_vs_market=position.relative_strength_vs_market,
+            relative_strength_vs_sector=position.relative_strength_vs_sector,
             entry_date=position.entry_date.date().isoformat(),
             exit_date=day.date().isoformat(),
             entry_price=position.entry_price,
             exit_price=exit_price,
             shares=position.shares,
+            holding_sessions=int(data[symbol].loc[position.entry_date:day].shape[0]),
             stop_price=position.stop_price,
             target_price=position.target_price,
             exit_reason=reason,
@@ -171,16 +351,25 @@ def run_backtest(
             elif float(bar["Open"]) >= position.target_price:
                 close_position(symbol, position, day, float(bar["Open"]), "target_gap")
 
-        for candidate in sorted(pending, key=lambda item: (item.prob_gain_10d, item.score, item.reward_risk), reverse=True):
+        for signal in sorted(
+            pending,
+            key=lambda item: (
+                item.candidate.prob_gain_10d,
+                item.candidate.score,
+                item.candidate.reward_risk,
+            ),
+            reverse=True,
+        ):
+            candidate = signal.candidate
             bar = today.get(candidate.symbol)
             if bar is None or candidate.symbol in positions:
                 continue
             if len(positions) >= cfg.max_open_positions:
                 break
-            fill_price = float(bar["Open"]) * (1 + slip)
+            fill_price = float(bar["Open"]) * (1 + market_cost)
             live_cfg = replace(cfg, account_size=max(cash, 0.0))
             sized = refresh_candidate_price(candidate, fill_price, live_cfg)
-            if sized is None or sized.shares * fill_price > cash:
+            if sized is None or sized.shares * (fill_price + commission_per_share) > cash:
                 continue
             open_risk = sum(position.initial_risk for position in positions.values())
             if open_risk + sized.risk_dollars > cash * cfg.max_combined_risk_fraction:
@@ -194,6 +383,14 @@ def run_backtest(
                 stop_price=sized.stop,
                 target_price=fill_price * (1 + cfg.target_percent / 100),
                 initial_risk=sized.risk_dollars,
+                sector=sectors[sized.symbol],
+                sector_etf=signal.sector_etf,
+                market_regime=signal.market_regime,
+                stock_return_20d=signal.stock_return_20d,
+                market_return_20d=signal.market_return_20d,
+                sector_return_20d=signal.sector_return_20d,
+                relative_strength_vs_market=signal.relative_strength_vs_market,
+                relative_strength_vs_sector=signal.relative_strength_vs_sector,
             )
         pending = []
 
@@ -207,7 +404,7 @@ def run_backtest(
             else:
                 target_trigger = position.target_price
                 if target_fill_mode == "trade_through":
-                    target_trigger *= 1 + target_trade_through_bps / 10_000
+                    target_trigger *= 1 + (target_trade_through_bps + spread_bps / 2) / 10_000
                 if float(bar["High"]) >= target_trigger:
                     close_position(symbol, position, day, position.target_price, "target")
 
@@ -216,16 +413,60 @@ def run_backtest(
                 if day not in bars.index:
                     continue
                 prefix = bars.loc[:day]
-                candidate = strategy(symbol, prefix, cfg)
+                cache_key = (config_fingerprint, symbol, day)
+                if cache_key not in strategy_cache:
+                    strategy_cache[cache_key] = strategy(symbol, prefix, cfg)
+                candidate = strategy_cache[cache_key]
                 if candidate is not None and symbol not in positions:
-                    pending.append(candidate)
+                    stock_return = _value_at(stock_returns_20d[symbol], day)
+                    market_return = _value_at(market_returns_20d, day)
+                    sector = sectors[symbol]
+                    sector_etf = sector_etfs.get(sector)
+                    sector_return = _value_at(sector_returns_20d.get(sector_etf), day) if sector_etf else None
+                    pending.append(_Signal(
+                        candidate=candidate,
+                        market_regime=market_regimes.get(day, "UNKNOWN"),
+                        sector=sector,
+                        sector_etf=sector_etf,
+                        stock_return_20d=stock_return,
+                        market_return_20d=market_return,
+                        sector_return_20d=sector_return,
+                        relative_strength_vs_market=(stock_return - market_return)
+                        if stock_return is not None and market_return is not None else None,
+                        relative_strength_vs_sector=(stock_return - sector_return)
+                        if stock_return is not None and sector_return is not None else None,
+                    ))
 
         last_closes.update({symbol: (day, float(bar["Close"])) for symbol, bar in today.items()})
-        marked_equity = cash + sum(
+        gross_exposure = sum(
             position.shares * last_closes[symbol][1]
             for symbol, position in positions.items()
             if symbol in last_closes
         )
+        marked_equity = cash + gross_exposure
+        exposure_fractions.append(gross_exposure / marked_equity if marked_equity > 0 else 0.0)
+        sector_market_values = {sector: 0.0 for sector in tracked_sectors}
+        for symbol, position in positions.items():
+            if symbol in last_closes:
+                sector_market_values[position.sector] += position.shares * last_closes[symbol][1]
+        for sector, market_value in sector_market_values.items():
+            sector_exposure_fractions[sector].append(
+                market_value / marked_equity if marked_equity > 0 else 0.0
+            )
+
+        open_symbols = list(positions)
+        if len(open_symbols) > 1:
+            return_frame = pd.concat(
+                {symbol: daily_returns[symbol].loc[:day] for symbol in open_symbols},
+                axis=1,
+            ).tail(60).dropna()
+            if len(return_frame) >= 20:
+                correlation_matrix = return_frame.corr().to_numpy()
+                pair_correlations = correlation_matrix[np.triu_indices(len(open_symbols), k=1)]
+                pair_correlations = pair_correlations[np.isfinite(pair_correlations)]
+                if len(pair_correlations):
+                    daily_pairwise_correlations.append(float(np.mean(pair_correlations)))
+                    maximum_pairwise_correlations.append(float(np.max(pair_correlations)))
         equity_values.append(marked_equity)
         equity_dates.append(day)
 
@@ -241,10 +482,59 @@ def run_backtest(
     winners = [trade.realized_pnl for trade in trades if trade.realized_pnl > 0]
     losers = [trade.realized_pnl for trade in trades if trade.realized_pnl < 0]
     gross_loss = abs(sum(losers))
+    market_regime_metrics = {}
+    for regime in sorted({trade.market_regime for trade in trades}):
+        regime_trades = [trade for trade in trades if trade.market_regime == regime]
+        regime_wins = [trade.realized_pnl for trade in regime_trades if trade.realized_pnl > 0]
+        regime_losses = [trade.realized_pnl for trade in regime_trades if trade.realized_pnl < 0]
+        regime_gross_loss = abs(sum(regime_losses))
+        market_regime_metrics[regime] = {
+            "trade_count": len(regime_trades),
+            "win_rate": len(regime_wins) / len(regime_trades),
+            "net_pnl": float(sum(trade.realized_pnl for trade in regime_trades)),
+            "average_r": float(np.mean([trade.realized_r for trade in regime_trades])),
+            "profit_factor": sum(regime_wins) / regime_gross_loss if regime_gross_loss else (float("inf") if regime_wins else 0.0),
+        }
+    returns = equity_curve.pct_change().dropna()
+    daily_std = float(returns.std(ddof=1)) if len(returns) > 1 else 0.0
+    annualized_volatility = daily_std * np.sqrt(252)
+    downside_deviation = float(np.sqrt(np.mean(np.square(np.minimum(returns, 0))))) if len(returns) else 0.0
+    elapsed_days = (equity_curve.index[-1] - equity_curve.index[0]).days if len(equity_curve) > 1 else 0
+    cagr = None
+    if elapsed_days > 0 and cfg.account_size > 0 and cash > 0:
+        cagr = float((cash / cfg.account_size) ** (365.25 / elapsed_days) - 1)
+    mean_daily_return = float(returns.mean()) if len(returns) else 0.0
+    sharpe_ratio = mean_daily_return / daily_std * np.sqrt(252) if daily_std > 0 else None
+    sortino_ratio = mean_daily_return * np.sqrt(252) / downside_deviation if downside_deviation > 0 else None
+    calmar_ratio = cagr / abs(float(drawdown.min())) if cagr is not None and drawdown.min() < 0 else None
+    losing_streak = 0
+    max_consecutive_losses = 0
+    for trade in trades:
+        losing_streak = losing_streak + 1 if trade.realized_pnl < 0 else 0
+        max_consecutive_losses = max(max_consecutive_losses, losing_streak)
     benchmark_return = None
     if benchmark is not None and not benchmark.empty:
         benchmark_bars = _normalize_bars(benchmark)
         benchmark_return = float(benchmark_bars["Close"].iloc[-1] / benchmark_bars["Open"].iloc[0] - 1)
+    benchmark_alpha = cash / cfg.account_size - 1 - benchmark_return if benchmark_return is not None else None
+    average_equity = float(equity_curve.mean()) if not equity_curve.empty else 0.0
+    traded_notional = sum((trade.entry_price + trade.exit_price) * trade.shares for trade in trades)
+    sector_metrics = {
+        sector: {
+            "average_exposure": float(np.mean(values)) if values else 0.0,
+            "peak_exposure": float(np.max(values)) if values else 0.0,
+        }
+        for sector, values in sector_exposure_fractions.items()
+    }
+    sector_etf_mapping = {sector: etf for sector, etf in sector_etfs.items()}
+    relative_strength_market = [
+        trade.relative_strength_vs_market for trade in trades
+        if trade.relative_strength_vs_market is not None
+    ]
+    relative_strength_sector = [
+        trade.relative_strength_vs_sector for trade in trades
+        if trade.relative_strength_vs_sector is not None
+    ]
 
     return BacktestResult(
         trades=trades,
@@ -256,49 +546,230 @@ def run_backtest(
         win_rate=len(winners) / len(trades) if trades else 0.0,
         average_r=float(np.mean([trade.realized_r for trade in trades])) if trades else 0.0,
         profit_factor=sum(winners) / gross_loss if gross_loss else (float("inf") if winners else 0.0),
+        strategy_id=strategy_id,
+        strategy_version=strategy_version,
+        configuration_hash=config_fingerprint,
+        configuration=asdict(cfg),
+        cagr=cagr,
+        benchmark_alpha=benchmark_alpha,
+        annualized_volatility=float(annualized_volatility),
+        sharpe_ratio=float(sharpe_ratio) if sharpe_ratio is not None else None,
+        sortino_ratio=float(sortino_ratio) if sortino_ratio is not None else None,
+        calmar_ratio=float(calmar_ratio) if calmar_ratio is not None else None,
+        average_win=float(np.mean(winners)) if winners else None,
+        average_loss=float(np.mean(losers)) if losers else None,
+        median_win=float(np.median(winners)) if winners else None,
+        median_loss=float(np.median(losers)) if losers else None,
+        expectancy_dollars=float(np.mean([trade.realized_pnl for trade in trades])) if trades else 0.0,
+        max_consecutive_losses=max_consecutive_losses,
+        average_holding_sessions=float(np.mean([trade.holding_sessions for trade in trades])) if trades else 0.0,
+        average_gross_exposure=float(np.mean(exposure_fractions)) if exposure_fractions else 0.0,
+        turnover=traded_notional / average_equity if average_equity > 0 else 0.0,
+        market_regime_metrics=market_regime_metrics,
+        sector_mapping=sectors,
+        sector_etf_mapping=sector_etf_mapping,
+        sector_exposure_metrics=sector_metrics,
+        average_pairwise_correlation=(float(np.mean(daily_pairwise_correlations)) if daily_pairwise_correlations else None),
+        max_pairwise_correlation=(float(np.max(maximum_pairwise_correlations)) if maximum_pairwise_correlations else None),
+        average_relative_strength_vs_market=(float(np.mean(relative_strength_market)) if relative_strength_market else None),
+        average_relative_strength_vs_sector=(float(np.mean(relative_strength_sector)) if relative_strength_sector else None),
     )
 
 
-def format_backtest_report(result: BacktestResult, *, symbols: list[str], start: str, end: str,
-                           slippage_bps: float, target_fill_mode: str,
-                           target_trade_through_bps: float) -> str:
-    total_return = result.ending_equity / result.starting_equity - 1
-    benchmark = "N/A" if result.benchmark_return is None else f"{result.benchmark_return:.2%}"
-    profit_factor = "inf" if np.isinf(result.profit_factor) else f"{result.profit_factor:.2f}"
-    lines = [
-        "# Swing Trader Backtest",
+def format_spread_sensitivity_report(
+    results: list[tuple[float, BacktestResult]],
+    *,
+    run_ids: list[str],
+    database_path: str,
+    symbols: list[str],
+    start: str,
+    end: str,
+    slippage_bps: float,
+    commission_per_share: float,
+    target_fill_mode: str,
+    target_trade_through_bps: float,
+) -> str:
+    if not results:
+        raise ValueError("At least one spread scenario is required")
+    if len(run_ids) != len(results):
+        raise ValueError("Each sensitivity scenario must have one persisted run ID")
+    base_result = results[0][1]
+    identity = (base_result.strategy_id, base_result.strategy_version, base_result.configuration_hash)
+    if any(
+        (result.strategy_id, result.strategy_version, result.configuration_hash) != identity
+        for _, result in results[1:]
+    ):
+        raise ValueError("All scenarios must use the same strategy and trading configuration")
+
+    report = [
+        "# Swing Trader Execution-Cost Sensitivity",
         "",
         f"Period: {start} to {end}",
         f"Symbols: {', '.join(symbols)}",
-        "Strategy: existing technical candidate rules; historical sentiment disabled",
-        "Data: Alpaca IEX, split-adjusted daily bars",
-        "Signal timing: completed daily close; entry: following session open",
-        f"Execution: {slippage_bps:g} bps slippage per market-side fill; stop-first if daily barriers both touched",
-        f"Target limit fills: {target_fill_mode}; trade-through threshold: {target_trade_through_bps:g} bps",
-        "Target fills execute at the limit price; commissions default to $0",
-        "Coverage: explicit current-day symbols only; historical universe and delisted symbols are not reconstructed",
+        f"Strategy: {base_result.strategy_id} v{base_result.strategy_version}",
+        f"Trading configuration SHA-256: {base_result.configuration_hash}",
+        f"SQLite ledger: `{database_path}`",
+        "Sector mapping (manual, descriptive):",
+        "```json",
+        json.dumps(base_result.sector_mapping, sort_keys=True, indent=2),
+        "```",
+        "Sector ETF mapping:",
+        "```json",
+        json.dumps(base_result.sector_etf_mapping, sort_keys=True, indent=2),
+        "```",
+        "Trading configuration snapshot:",
+        "```json",
+        json.dumps(base_result.configuration, sort_keys=True, indent=2),
+        "```",
+        "Strategy and historical bars are held constant across scenarios.",
+        f"Slippage: {slippage_bps:g} bps per market-side fill",
+        f"Commission: ${commission_per_share:g} per share per side",
+        f"Target limit fills: {target_fill_mode}; base trade-through: {target_trade_through_bps:g} bps, plus half-spread",
         "",
-        "## Summary",
+        "## Scenario Comparison",
         "",
-        f"- Starting equity: ${result.starting_equity:,.2f}",
-        f"- Ending equity: ${result.ending_equity:,.2f}",
-        f"- Total return: {total_return:.2%}",
-        f"- SPY buy-and-hold (price return): {benchmark}",
-        f"- Maximum drawdown: {result.max_drawdown:.2%}",
-        f"- Trades: {len(result.trades)}",
-        f"- Win rate: {result.win_rate:.2%}",
-        f"- Average realized R: {result.average_r:.2f}",
-        f"- Profit factor: {profit_factor}",
-        "",
-        "## Trade Ledger",
-        "",
-        "| Symbol | Entry date | Exit date | Shares | Entry | Exit | Reason | P&L | R | Setup |",
-        "|---|---|---|---:|---:|---:|---|---:|---:|---|",
+        "| Run ID | Full spread (bps) | Ending equity | Return | Max drawdown | Trades | Win rate | Avg R | Profit factor | Avg gross exposure | Turnover | Avg corr | Max corr | SPY price return |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    lines.extend(
-        f"| {trade.symbol} | {trade.entry_date} | {trade.exit_date} | {trade.shares} | "
+    for run_id, (spread_bps, result) in zip(run_ids, results):
+        total_return = result.ending_equity / result.starting_equity - 1
+        profit_factor = "inf" if np.isinf(result.profit_factor) else f"{result.profit_factor:.2f}"
+        benchmark = "N/A" if result.benchmark_return is None else f"{result.benchmark_return:.2%}"
+        average_correlation = "N/A" if result.average_pairwise_correlation is None else f"{result.average_pairwise_correlation:.2f}"
+        maximum_correlation = "N/A" if result.max_pairwise_correlation is None else f"{result.max_pairwise_correlation:.2f}"
+        report.append(
+            f"| {run_id} | {spread_bps:g} | ${result.ending_equity:,.2f} | {total_return:.2%} | "
+            f"{result.max_drawdown:.2%} | {len(result.trades)} | {result.win_rate:.2%} | "
+            f"{result.average_r:.2f} | {profit_factor} | {result.average_gross_exposure:.2%} | "
+            f"{result.turnover:.2f}x | {average_correlation} | {maximum_correlation} | {benchmark} |"
+        )
+
+    report.extend([
+        "",
+        "## Sector Exposure",
+        "",
+        "Exposure is sector market value divided by total marked equity, averaged over each session; peak is the maximum session value.",
+        "Sector labels are a manual present-day map, not point-in-time historical classifications.",
+        "",
+        "| Full spread (bps) | Sector | Average exposure | Peak exposure |",
+        "|---:|---|---:|---:|",
+    ])
+    for spread_bps, result in results:
+        for sector, metrics in sorted(result.sector_exposure_metrics.items()):
+            report.append(
+                f"| {spread_bps:g} | {sector} | {metrics['average_exposure']:.2%} | "
+                f"{metrics['peak_exposure']:.2%} |"
+            )
+
+    report.extend([
+        "",
+        "## Open-Position Correlation",
+        "",
+        "Correlation uses up to 60 daily returns through each session close, requires 20 common observations, and is sampled only when multiple positions are open.",
+        "",
+        "| Full spread (bps) | Average pairwise correlation | Maximum pairwise correlation |",
+        "|---:|---:|---:|",
+    ])
+    for spread_bps, result in results:
+        average_correlation = "N/A" if result.average_pairwise_correlation is None else f"{result.average_pairwise_correlation:.2f}"
+        maximum_correlation = "N/A" if result.max_pairwise_correlation is None else f"{result.max_pairwise_correlation:.2f}"
+        report.append(f"| {spread_bps:g} | {average_correlation} | {maximum_correlation} |")
+
+    report.extend([
+        "",
+        "## Relative Strength",
+        "",
+        "20-session trailing returns are measured at each signal close. Relative strength is stock return minus benchmark return in percentage points; values do not affect signals or sizing.",
+        "",
+        "| Full spread (bps) | Average stock return | Average SPY return | Average stock - SPY | Average sector ETF return | Average stock - sector |",
+        "|---:|---:|---:|---:|---:|---:|",
+    ])
+    for spread_bps, result in results:
+        stock_returns = [trade.stock_return_20d for trade in result.trades if trade.stock_return_20d is not None]
+        market_returns = [trade.market_return_20d for trade in result.trades if trade.market_return_20d is not None]
+        sector_returns = [trade.sector_return_20d for trade in result.trades if trade.sector_return_20d is not None]
+        percent = lambda values: "N/A" if not values else f"{np.mean(values):.2%}"
+        relative_market = "N/A" if result.average_relative_strength_vs_market is None else f"{result.average_relative_strength_vs_market:.2%}"
+        relative_sector = "N/A" if result.average_relative_strength_vs_sector is None else f"{result.average_relative_strength_vs_sector:.2%}"
+        report.append(
+            f"| {spread_bps:g} | {percent(stock_returns)} | {percent(market_returns)} | {relative_market} | "
+            f"{percent(sector_returns)} | {relative_sector} |"
+        )
+
+    report.extend([
+        "",
+        "## Market Regime Performance",
+        "",
+        "Regime at the signal close uses SPY: BULL means close > SMA50 > SMA200; BEAR means "
+        "close < SMA50 < SMA200; HIGH_VOLATILITY means annualized 20-session realized "
+        "volatility >= 30%; otherwise NEUTRAL. Insufficient SPY history is UNKNOWN.",
+        "Regimes are descriptive only and do not alter entries, sizing, or exits.",
+        "",
+        "| Full spread (bps) | Regime | Trades | Win rate | Net P&L | Avg R | Profit factor |",
+        "|---:|---|---:|---:|---:|---:|---:|",
+    ])
+    for spread_bps, result in results:
+        for regime, metrics in sorted(result.market_regime_metrics.items()):
+            regime_profit_factor = metrics["profit_factor"]
+            regime_pf_label = "inf" if np.isinf(regime_profit_factor) else f"{regime_profit_factor:.2f}"
+            report.append(
+                f"| {spread_bps:g} | {regime} | {metrics['trade_count']} | {metrics['win_rate']:.2%} | "
+                f"${metrics['net_pnl']:.2f} | {metrics['average_r']:.2f} | {regime_pf_label} |"
+            )
+
+    report.extend([
+        "",
+        "## Annualized and Risk-Adjusted Metrics",
+        "",
+        "Risk-free rate assumed to be 0%; volatility and ratios annualized using 252 trading sessions.",
+        "",
+        "| Full spread (bps) | CAGR | Alpha vs SPY | Annualized volatility | Sharpe | Sortino | Calmar |",
+        "|---:|---:|---:|---:|---:|---:|---:|",
+    ])
+    for spread_bps, result in results:
+        ratio = lambda value: "N/A" if value is None else f"{value:.2f}"
+        percent = lambda value: "N/A" if value is None else f"{value:.2%}"
+        report.append(
+            f"| {spread_bps:g} | {percent(result.cagr)} | {percent(result.benchmark_alpha)} | "
+            f"{result.annualized_volatility:.2%} | {ratio(result.sharpe_ratio)} | "
+            f"{ratio(result.sortino_ratio)} | {ratio(result.calmar_ratio)} |"
+        )
+
+    report.extend([
+        "",
+        "## Trade Distribution",
+        "",
+        "Expectancy is mean net P&L per closed trade; Avg R is mean realized R.",
+        "",
+        "| Full spread (bps) | Average win | Average loss | Median win | Median loss | Expectancy | Avg R | Max losing streak | Avg hold (sessions) |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ])
+    for spread_bps, result in results:
+        money = lambda value: "N/A" if value is None else f"${value:.2f}"
+        report.append(
+            f"| {spread_bps:g} | {money(result.average_win)} | {money(result.average_loss)} | "
+            f"{money(result.median_win)} | {money(result.median_loss)} | ${result.expectancy_dollars:.2f} | "
+            f"{result.average_r:.2f} | {result.max_consecutive_losses} | {result.average_holding_sessions:.1f} |"
+        )
+
+    ledger_spread, ledger_result = min(results, key=lambda item: abs(item[0] - 5.0))
+    report.extend([
+        "",
+        f"## Trade Ledger ({ledger_spread:g} bps spread scenario)",
+        "",
+        "| Strategy | Version | Symbol | Sector | Sector ETF | Regime | Entry date | Exit date | Stock 20d | SPY 20d | Sector 20d | Stock-SPY | Stock-sector | Shares | Held | Entry | Exit | Reason | P&L | R | Setup |",
+        "|---|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---|",
+    ])
+    report.extend(
+        f"| {trade.strategy_id} | {trade.strategy_version} | {trade.symbol} | {trade.sector} | "
+        f"{trade.sector_etf or 'N/A'} | {trade.market_regime} | {trade.entry_date} | {trade.exit_date} | "
+        f"{_format_percent(trade.stock_return_20d)} | {_format_percent(trade.market_return_20d)} | "
+        f"{_format_percent(trade.sector_return_20d)} | "
+        f"{_format_percent(trade.relative_strength_vs_market)} | "
+        f"{_format_percent(trade.relative_strength_vs_sector)} | "
+        f"{trade.shares} | {trade.holding_sessions} | "
         f"${trade.entry_price:.2f} | ${trade.exit_price:.2f} | {trade.exit_reason} | "
         f"${trade.realized_pnl:.2f} | {trade.realized_r:.2f} | {trade.setup} |"
-        for trade in result.trades
+        for trade in ledger_result.trades
     )
-    return "\n".join(lines) + "\n"
+    return "\n".join(report) + "\n"
