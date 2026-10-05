@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from .config import TradingConfig
-from .scanner import TradeCandidate, analyze, refresh_candidate_price
+from .scanner import TradeCandidate, evaluate_candidate, refresh_candidate_price
 
 
 class MarketDataProvider(Protocol):
@@ -87,14 +87,8 @@ class _Position:
     initial_risk: float
 
 
-def _neutral_sentiment(_symbol: str):
-    from .sentiment import SentimentResult
-
-    return SentimentResult(0.0, 0, None, "Technical Trend")
-
-
 def _historical_strategy(symbol: str, bars: pd.DataFrame, cfg: TradingConfig):
-    return analyze(symbol, bars, cfg, sentiment_fn=_neutral_sentiment)
+    return evaluate_candidate(symbol, bars, cfg)
 
 
 def _normalize_bars(bars: pd.DataFrame) -> pd.DataFrame:
@@ -112,12 +106,16 @@ def run_backtest(
     *,
     slippage_bps: float = 5.0,
     commission_per_share: float = 0.0,
+    target_fill_mode: str = "trade_through",
+    target_trade_through_bps: float = 5.0,
     strategy: Callable[[str, pd.DataFrame, TradingConfig], TradeCandidate | None] = _historical_strategy,
     benchmark: pd.DataFrame | None = None,
 ) -> BacktestResult:
     """Run close-generated signals at the following session's open using daily bars."""
-    if slippage_bps < 0 or commission_per_share < 0:
+    if slippage_bps < 0 or commission_per_share < 0 or target_trade_through_bps < 0:
         raise ValueError("Execution costs cannot be negative")
+    if target_fill_mode not in {"touch", "trade_through"}:
+        raise ValueError("Target fill mode must be 'touch' or 'trade_through'")
 
     data = {symbol: _normalize_bars(bars) for symbol, bars in histories.items() if not bars.empty}
     sessions = sorted(set().union(*(set(bars.index) for bars in data.values()))) if data else []
@@ -206,8 +204,12 @@ def run_backtest(
                 continue
             if float(bar["Low"]) <= position.stop_price:
                 close_position(symbol, position, day, position.stop_price, "stop")
-            elif float(bar["High"]) >= position.target_price:
-                close_position(symbol, position, day, position.target_price, "target")
+            else:
+                target_trigger = position.target_price
+                if target_fill_mode == "trade_through":
+                    target_trigger *= 1 + target_trade_through_bps / 10_000
+                if float(bar["High"]) >= target_trigger:
+                    close_position(symbol, position, day, position.target_price, "target")
 
         if session_index < len(sessions) - 1:
             for symbol, bars in data.items():
@@ -258,7 +260,8 @@ def run_backtest(
 
 
 def format_backtest_report(result: BacktestResult, *, symbols: list[str], start: str, end: str,
-                           slippage_bps: float) -> str:
+                           slippage_bps: float, target_fill_mode: str,
+                           target_trade_through_bps: float) -> str:
     total_return = result.ending_equity / result.starting_equity - 1
     benchmark = "N/A" if result.benchmark_return is None else f"{result.benchmark_return:.2%}"
     profit_factor = "inf" if np.isinf(result.profit_factor) else f"{result.profit_factor:.2f}"
@@ -271,7 +274,8 @@ def format_backtest_report(result: BacktestResult, *, symbols: list[str], start:
         "Data: Alpaca IEX, split-adjusted daily bars",
         "Signal timing: completed daily close; entry: following session open",
         f"Execution: {slippage_bps:g} bps slippage per market-side fill; stop-first if daily barriers both touched",
-        "Limit fills: profit targets fill at target when touched; commissions default to $0",
+        f"Target limit fills: {target_fill_mode}; trade-through threshold: {target_trade_through_bps:g} bps",
+        "Target fills execute at the limit price; commissions default to $0",
         "Coverage: explicit current-day symbols only; historical universe and delisted symbols are not reconstructed",
         "",
         "## Summary",

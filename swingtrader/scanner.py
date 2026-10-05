@@ -86,14 +86,13 @@ def refresh_candidate_price(
     )
 
 
-def analyze(
+def evaluate_candidate(
     symbol: str,
     raw: pd.DataFrame,
     cfg: TradingConfig,
     current_price: float | None = None,
-    sentiment_fn=get_sentiment,
 ) -> TradeCandidate | None:
-    if raw.empty:
+    if raw.empty or len(raw) < 229:
         return None
 
     df = add_indicators(raw).dropna()
@@ -169,17 +168,7 @@ def analyze(
     if score < 55:
         return None
 
-    # 5. News Sentiment & Catalyst Extraction
-    sentiment = sentiment_fn(symbol)
-    if sentiment.article_count:
-        if sentiment.score >= cfg.sentiment_positive_threshold:
-            score += cfg.sentiment_bonus_score
-            reasons.append(f"Positive Sentiment ({sentiment.score:+.2f})")
-        elif sentiment.score <= cfg.sentiment_negative_threshold:
-            score -= cfg.sentiment_penalty_score
-            reasons.append(f"Negative Sentiment ({sentiment.score:+.2f})")
-
-    # 6. Historical Forward Return Probabilities (10 Trading Days)
+    # Historical forward-return statistics use only labels realized by the last input bar.
     prob_gain_10d, prob_loss_5d = calculate_forward_probabilities(df)
 
     # 7. Targets & Risk Management
@@ -225,10 +214,43 @@ def analyze(
         shares=shares,
         risk_dollars=risk_dollars,
         reward_risk=rr_1,
-        main_catalyst=sentiment.catalyst,
+        main_catalyst="Technical Trend",
         setup=setup,
+        reasons=reasons,
+        sentiment_score=0.0,
+        sentiment_headline=None,
+        reference_close=price,
+    )
+
+
+def analyze(
+    symbol: str,
+    raw: pd.DataFrame,
+    cfg: TradingConfig,
+    current_price: float | None = None,
+    sentiment_fn=get_sentiment,
+) -> TradeCandidate | None:
+    """Evaluate technical rules, then optionally enrich a qualifying candidate with live sentiment."""
+    candidate = evaluate_candidate(symbol, raw, cfg, current_price)
+    if candidate is None:
+        return None
+
+    sentiment = sentiment_fn(symbol)
+    score = candidate.score
+    reasons = list(candidate.reasons)
+    if sentiment.article_count:
+        if sentiment.score >= cfg.sentiment_positive_threshold:
+            score += cfg.sentiment_bonus_score
+            reasons.append(f"Positive Sentiment ({sentiment.score:+.2f})")
+        elif sentiment.score <= cfg.sentiment_negative_threshold:
+            score -= cfg.sentiment_penalty_score
+            reasons.append(f"Negative Sentiment ({sentiment.score:+.2f})")
+
+    return replace(
+        candidate,
+        score=min(100, max(0, score)),
+        main_catalyst=sentiment.catalyst,
         reasons=reasons,
         sentiment_score=sentiment.score,
         sentiment_headline=sentiment.headline,
-        reference_close=price,
     )

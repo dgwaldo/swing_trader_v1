@@ -5,15 +5,56 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import numpy as np
 import pandas as pd
 
 import main
 from swingtrader.config import TradingConfig
 from swingtrader.data import download_batch, download_latest_prices
-from swingtrader.scanner import TradeCandidate, refresh_candidate_price
+from swingtrader.scanner import TradeCandidate, analyze, evaluate_candidate, refresh_candidate_price
+from swingtrader.sentiment import SentimentResult
 
 
 class ScannerPerformancePathTests(unittest.TestCase):
+    def test_technical_candidate_evaluation_is_pure_and_matches_neutral_analyze(self):
+        close = np.linspace(10.0, 20.0, 240)
+        history = pd.DataFrame(
+            {
+                "Open": close,
+                "High": close,
+                "Low": close - 0.2,
+                "Close": close,
+                "Volume": [1_000_000] * len(close),
+            },
+            index=pd.date_range("2025-01-02", periods=len(close)),
+        )
+        config = TradingConfig()
+
+        with patch("swingtrader.scanner.get_sentiment", side_effect=AssertionError("unexpected network lookup")):
+            first = evaluate_candidate("TEST", history, config)
+            second = evaluate_candidate("TEST", history, config)
+
+        if first is None or second is None:
+            self.fail("Expected technical candidate from the synthetic uptrend")
+        self.assertEqual(first, second)
+        neutral = analyze(
+            "TEST",
+            history,
+            config,
+            sentiment_fn=lambda _symbol: SentimentResult(0.0, 0, None, "Technical Trend"),
+        )
+        self.assertEqual(first, neutral)
+        enriched = analyze(
+            "TEST",
+            history,
+            config,
+            sentiment_fn=lambda _symbol: SentimentResult(0.8, 1, "Positive headline", "Company News"),
+        )
+        if enriched is None:
+            self.fail("Expected sentiment-enriched candidate")
+        self.assertEqual(enriched.score, first.score + config.sentiment_bonus_score)
+        self.assertEqual(enriched.sentiment_headline, "Positive headline")
+
     def test_candidate_table_header_matches_separator(self):
         with redirect_stdout(io.StringIO()) as output:
             main.print_candidates_table([])

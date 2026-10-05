@@ -140,9 +140,12 @@ Backtest market data uses the Alpaca credentials in the ignored root `config.py`
 Signals are evaluated after each completed close, entries occur no earlier than
 the next session's open, and stop gaps fill at the open with configured slippage.
 When a daily candle touches both stop and target, the simulator assumes the stop
-happened first. Targets fill at their limit price when touched. Slippage defaults
-to 5 basis points per fill and can be changed with `--slippage-bps`; commissions
-are currently zero. The report compares price return against SPY.
+happened first. Target limit orders default to requiring a 5-basis-point
+trade-through before assuming a fill; `--target-fill-mode touch` runs the more
+optimistic touch assumption, and `--target-trade-through-bps` changes the
+threshold. Target fills are recorded at the limit price. Slippage defaults to 5
+basis points per fill and can be changed with `--slippage-bps`; commissions are
+currently zero. The report compares price return against SPY.
 
 This is a first baseline, not yet a full validation framework: historical news is
 disabled, the explicit symbol list does not reconstruct historical constituents,

@@ -230,7 +230,16 @@ def run_paper_bot(cfg, symbols=None, top=25, *, once=False):
         sleep(cfg.bot_poll_seconds)
 
 
-def run_backtest_cli(symbols, start, end, cfg, *, slippage_bps=5.0):
+def run_backtest_cli(
+    symbols,
+    start,
+    end,
+    cfg,
+    *,
+    slippage_bps=5.0,
+    target_fill_mode="trade_through",
+    target_trade_through_bps=5.0,
+):
     from swingtrader.backtest import (
         AlpacaMarketDataProvider,
         format_backtest_report,
@@ -249,13 +258,22 @@ def run_backtest_cli(symbols, start, end, cfg, *, slippage_bps=5.0):
         print(f"No Alpaca daily bars returned for: {', '.join(missing)}")
     if not histories:
         raise ValueError("Alpaca returned no history for the requested symbols")
-    result = run_backtest(histories, cfg, slippage_bps=slippage_bps, benchmark=benchmark)
+    result = run_backtest(
+        histories,
+        cfg,
+        slippage_bps=slippage_bps,
+        target_fill_mode=target_fill_mode,
+        target_trade_through_bps=target_trade_through_bps,
+        benchmark=benchmark,
+    )
     report = format_backtest_report(
         result,
         symbols=list(histories),
         start=start,
         end=end,
         slippage_bps=slippage_bps,
+        target_fill_mode=target_fill_mode,
+        target_trade_through_bps=target_trade_through_bps,
     )
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
     report_path = REPORT_DIR / f"backtest_{timestamp}.md"
@@ -322,6 +340,18 @@ def main():
             parser.add_argument("--start", help="Backtest start date (YYYY-MM-DD)")
             parser.add_argument("--end", help="Backtest end date (YYYY-MM-DD)")
             parser.add_argument("--slippage-bps", type=float, default=5.0, help="Slippage per fill in basis points")
+            parser.add_argument(
+                "--target-fill-mode",
+                choices=("touch", "trade_through"),
+                default="trade_through",
+                help="Target limit fill policy (default requires a trade-through)",
+            )
+            parser.add_argument(
+                "--target-trade-through-bps",
+                type=float,
+                default=5.0,
+                help="Required price trade-through for target fills (default 5 bps)",
+            )
             paper_modes = parser.add_mutually_exclusive_group()
             paper_modes.add_argument("--paper-preview", action="store_true", help="Check top candidate against Alpaca paper quotes without placing an order")
             paper_modes.add_argument("--paper-trade", action="store_true", help="Submit one Alpaca paper bracket order for the top candidate")
@@ -337,7 +367,15 @@ def main():
                 if date.fromisoformat(args.start) > date.fromisoformat(args.end):
                     parser.error("--start must not be later than --end")
                 config = build_config(minimum_price=args.min_price, maximum_price=args.max_price)
-                run_backtest_cli(args.symbols, args.start, args.end, config, slippage_bps=args.slippage_bps)
+                run_backtest_cli(
+                    args.symbols,
+                    args.start,
+                    args.end,
+                    config,
+                    slippage_bps=args.slippage_bps,
+                    target_fill_mode=args.target_fill_mode,
+                    target_trade_through_bps=args.target_trade_through_bps,
+                )
             elif args.paper_status or args.paper_reconcile:
                 from swingtrader.paper_trading import report_paper_status
 
