@@ -12,13 +12,142 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pandas as pd
+
 import main
 from swingtrader.config import TradingConfig, load_trading_config
 from swingtrader.scanner import TradeCandidate
-from swingtrader.paper_trading import bot_attempted_today, bot_capacity, check_bot_daily_halt, load_paper_credentials, plan_paper_order, record_paper_fills, review_paper_orders, submit_paper_candidate
+from swingtrader.paper_trading import (
+    bot_attempted_today,
+    bot_capacity,
+    check_bot_daily_halt,
+    enforce_correlation_limit,
+    enforce_sector_exposure_limit,
+    load_paper_credentials,
+    plan_paper_order,
+    record_paper_fills,
+    review_paper_orders,
+    submit_paper_candidate,
+)
 
 
 class PaperTradingTests(unittest.TestCase):
+    def test_correlation_guard_blocks_high_absolute_correlation(self):
+        dates = pd.bdate_range("2025-01-02", periods=61)
+        returns = [0.001 if index % 2 else -0.001 for index in range(61)]
+        prices = [10.0]
+        for daily_return in returns[1:]:
+            prices.append(prices[-1] * (1 + daily_return))
+        inverse_prices = [10.0]
+        for daily_return in returns[1:]:
+            inverse_prices.append(inverse_prices[-1] * (1 - daily_return))
+        candidate_history = pd.DataFrame({"Close": prices}, index=dates)
+        inverse_history = pd.DataFrame(
+            {"Close": inverse_prices},
+            index=dates,
+        )
+
+        with self.assertRaisesRegex(ValueError, "absolute correlation over 60 shared sessions"):
+            enforce_correlation_limit(
+                "F",
+                {"BAC"},
+                {"F": candidate_history, "BAC": inverse_history},
+                TradingConfig(),
+            )
+
+    def test_correlation_guard_rejects_missing_open_position_history(self):
+        history = pd.DataFrame(
+            {"Close": [10.0, 10.1]},
+            index=pd.bdate_range("2025-01-02", periods=2),
+        )
+        with self.assertRaisesRegex(ValueError, "missing daily bars for BAC"):
+            enforce_correlation_limit(
+                "F",
+                {"BAC"},
+                {"F": history},
+                TradingConfig(),
+            )
+
+    def test_paper_candidate_blocks_correlated_open_position_before_quote(self):
+        candidate = TradeCandidate(
+            symbol="F", score=70, prob_gain_10d=0.5, prob_loss_5d=0.2,
+            risk_rating="Medium", entry=10.0, stop=9.0, target_1pct=10.1,
+            target_1=11.5, target_2=13.0, shares=10, risk_dollars=10.0,
+            reward_risk=1.5, main_catalyst="Technical Trend", setup="Breakout", reasons=[],
+        )
+        dates = pd.bdate_range("2025-01-02", periods=61)
+        close = [10.0 * (1.001 if index % 2 else 0.999) ** index for index in range(61)]
+        histories = {
+            symbol: pd.DataFrame({"Close": close}, index=dates)
+            for symbol in ("F", "BAC")
+        }
+        trading = Mock()
+        trading.get_clock.return_value.is_open = True
+        trading.get_account.return_value = SimpleNamespace(
+            cash="1000", buying_power="1000", trading_blocked=False,
+        )
+        trading.get_all_positions.return_value = [SimpleNamespace(symbol="BAC", market_value="100")]
+        trading.get_orders.return_value = []
+        with (
+            patch("swingtrader.paper_trading.load_paper_credentials", return_value=("key", "secret")),
+            patch("alpaca.trading.client.TradingClient", return_value=trading),
+            patch(
+                "swingtrader.paper_trading.AlpacaMarketDataProvider",
+                return_value=SimpleNamespace(get_bars=Mock(return_value=histories)),
+            ) as provider,
+            patch("alpaca.data.historical.StockHistoricalDataClient") as data_client,
+        ):
+            with self.assertRaisesRegex(ValueError, "too correlated with open BAC exposure"):
+                submit_paper_candidate(candidate, TradingConfig(), execute=True)
+
+        provider.return_value.get_bars.assert_called_once()
+        data_client.assert_not_called()
+        trading.submit_order.assert_not_called()
+
+    def test_sector_cap_counts_positions_and_unfilled_pending_order_exposure(self):
+        cfg = TradingConfig(account_size=1000, max_sector_exposure_fraction=0.25)
+        positions = [SimpleNamespace(symbol="F", market_value="100")]
+        pending_orders = [SimpleNamespace(
+            symbol="RIVN", side="buy", status="new", qty="20", filled_qty="5", limit_price="10",
+        )]
+
+        with self.assertRaisesRegex(ValueError, "Consumer Discretionary sector exposure"):
+            enforce_sector_exposure_limit("CCL", 100, positions, pending_orders, cfg)
+        enforce_sector_exposure_limit("BAC", 100, positions, pending_orders, cfg)
+
+    def test_sector_cap_fails_closed_when_existing_exposure_cannot_be_verified(self):
+        cfg = TradingConfig()
+        with self.assertRaisesRegex(ValueError, "market value unavailable"):
+            enforce_sector_exposure_limit(
+                "F", 100, [SimpleNamespace(symbol="CCL")], [], cfg,
+            )
+
+    def test_paper_order_path_enforces_sector_cap_before_submission(self):
+        candidate = TradeCandidate(
+            symbol="F", score=70, prob_gain_10d=0.5, prob_loss_5d=0.2,
+            risk_rating="Medium", entry=10.0, stop=9.0, target_1pct=10.1,
+            target_1=11.5, target_2=13.0, shares=10, risk_dollars=10.0,
+            reward_risk=1.5, main_catalyst="Technical Trend", setup="Breakout", reasons=[],
+        )
+        trading = Mock()
+        trading.get_clock.return_value.is_open = True
+        trading.get_account.return_value = SimpleNamespace(
+            cash="1000", buying_power="1000", trading_blocked=False,
+        )
+        trading.get_all_positions.return_value = []
+        trading.get_orders.return_value = []
+        quote = SimpleNamespace(timestamp=datetime.now(timezone.utc), bid_price=9.99, ask_price=10.0)
+        cfg = TradingConfig(max_sector_exposure_fraction=0.05)
+        with (
+            patch("swingtrader.paper_trading.load_paper_credentials", return_value=("key", "secret")),
+            patch("alpaca.trading.client.TradingClient", return_value=trading),
+            patch("alpaca.data.historical.StockHistoricalDataClient") as data_client,
+        ):
+            data_client.return_value.get_stock_latest_quote.return_value = {"F": quote}
+            with self.assertRaisesRegex(ValueError, "Consumer Discretionary sector exposure"):
+                submit_paper_candidate(candidate, cfg, execute=True)
+        trading.submit_order.assert_not_called()
+
     def test_bot_reports_missing_alpaca_before_loop(self):
         with patch("main.importlib.util.find_spec", return_value=None), \
                 patch("main.run_paper_bot_cycle") as cycle:

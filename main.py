@@ -5,7 +5,7 @@ import math
 import sys
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import asdict, replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter, sleep
 from zoneinfo import ZoneInfo
@@ -16,6 +16,7 @@ from swingtrader.data import (
     download_latest_prices,
     fetch_market_candidates,
 )
+from swingtrader.market_data import AlpacaMarketDataProvider, YFinanceMarketDataProvider
 from swingtrader.scanner import analyze, refresh_candidate_price
 
 
@@ -110,7 +111,11 @@ def run_scanner(symbols=None, output_path=None, top=25, cfg=None):
         ) or FALLBACK_SYMBOLS
 
     print(f"Ingesting 1-year OHLCV bars for {len(symbols)} liquid ${cfg.minimum_price:.2f}-${cfg.maximum_price:.2f} candidates...")
-    historical_data = download_batch(symbols, period="1y", batch_size=80)
+    market_data = YFinanceMarketDataProvider(
+        batch_loader=download_batch,
+        latest_price_loader=download_latest_prices,
+    )
+    historical_data = market_data.get_bars(symbols, period="1y")
 
     candidates = []
     for symbol in symbols:
@@ -125,7 +130,7 @@ def run_scanner(symbols=None, output_path=None, top=25, cfg=None):
             print(f"  Error analyzing {symbol}: {exc}")
 
     if candidates:
-        latest_prices = download_latest_prices([candidate.symbol for candidate in candidates])
+        latest_prices = market_data.get_latest_prices([candidate.symbol for candidate in candidates])
         refreshed = []
         for candidate in candidates:
             latest_price = latest_prices.get(candidate.symbol)
@@ -243,19 +248,63 @@ def run_backtest_cli(
     commission_per_share=0.0,
     target_fill_mode="trade_through",
     target_trade_through_bps=5.0,
+    holdout_start=None,
+    walk_forward_months=None,
+    monte_carlo_simulations=1000,
+    monte_carlo_drawdown_threshold=-0.20,
+    universe_file=None,
+    experiment_file=None,
 ):
     from swingtrader.backtest import (
-        AlpacaMarketDataProvider,
         SECTOR_BY_SYMBOL,
         SECTOR_ETF_BY_SECTOR,
+        build_walk_forward_windows,
         format_spread_sensitivity_report,
         run_backtest,
     )
     from swingtrader.backtest_store import DEFAULT_BACKTEST_DB, persist_sensitivity_results
+    from swingtrader.experiments import load_config_experiments
+    from swingtrader.historical_universe import load_historical_universe
+    from swingtrader.market_data import (
+        AlpacaMarketDataProvider,
+        audit_daily_coverage,
+        format_data_coverage_report,
+        validate_daily_history,
+    )
     from swingtrader.paper_trading import load_paper_credentials
 
-    if not symbols:
-        raise ValueError("Backtests require explicit --symbols to make the tested universe reproducible")
+    start_date = date.fromisoformat(start)
+    end_date = date.fromisoformat(end)
+    if start_date > end_date:
+        raise ValueError("Backtest start date cannot be later than end date")
+    if bool(symbols) == bool(universe_file):
+        raise ValueError("Provide exactly one of explicit --symbols or --universe-file")
+    historical_universe = load_historical_universe(universe_file) if universe_file else None
+    if historical_universe is not None:
+        symbols = historical_universe.symbols_overlapping(
+            start_date, end_date,
+        )
+        if not symbols:
+            raise ValueError("Historical universe contains no members overlapping the requested backtest period")
+    if holdout_start is not None and not (
+        date.fromisoformat(start) < date.fromisoformat(holdout_start) <= date.fromisoformat(end)
+    ):
+        raise ValueError("--holdout-start must be later than --start and no later than --end")
+    if walk_forward_months is not None:
+        if holdout_start is None:
+            raise ValueError("--walk-forward-months requires --holdout-start")
+        if walk_forward_months < 1:
+            raise ValueError("--walk-forward-months must be at least 1")
+    if experiment_file is not None and (holdout_start is not None or walk_forward_months is not None):
+        raise ValueError("Config experiments cannot be combined with holdout or walk-forward evaluation")
+    if (
+        isinstance(monte_carlo_simulations, bool)
+        or not isinstance(monte_carlo_simulations, int)
+        or monte_carlo_simulations < 1
+    ):
+        raise ValueError("--monte-carlo-simulations must be at least 1")
+    if not math.isfinite(monte_carlo_drawdown_threshold) or not -1 <= monte_carlo_drawdown_threshold <= 0:
+        raise ValueError("--monte-carlo-drawdown-threshold must be between -1 and 0")
     key, secret = load_paper_credentials()
     provider = AlpacaMarketDataProvider(key, secret)
     sectors = {SECTOR_BY_SYMBOL[symbol] for symbol in symbols if symbol in SECTOR_BY_SYMBOL}
@@ -265,7 +314,25 @@ def run_backtest_cli(
         if sector in SECTOR_ETF_BY_SECTOR
     })
     requested_symbols = list(dict.fromkeys([*symbols, "SPY", *sector_etfs]))
-    histories = provider.get_bars(requested_symbols, start, end)
+    histories = provider.get_bars(requested_symbols, start=start, end=end)
+    membership = historical_universe.membership if historical_universe else None
+    for warning in validate_daily_history(
+        histories, requested_symbols, start, end, membership=membership,
+    ):
+        print(f"Market-data quality warning: {warning}")
+    coverage = audit_daily_coverage(
+        histories,
+        symbols,
+        start,
+        end,
+        membership=membership,
+    )
+    for item in coverage:
+        if item.missing_sessions:
+            print(
+                f"Historical coverage warning: {item.symbol} returned "
+                f"{item.returned_sessions}/{item.expected_sessions} expected member sessions"
+            )
     benchmark = histories.pop("SPY", None)
     sector_benchmarks = {etf: histories.pop(etf, None) for etf in sector_etfs}
     sector_benchmarks = {etf: bars for etf, bars in sector_benchmarks.items() if bars is not None}
@@ -277,44 +344,172 @@ def run_backtest_cli(
     spread_scenarios = [spread_bps] if spread_scenarios_bps is None else spread_scenarios_bps
     if not spread_scenarios or any(not math.isfinite(value) or value < 0 for value in spread_scenarios):
         raise ValueError("Spread scenarios must contain non-negative basis-point values")
+    config_experiments = (
+        load_config_experiments(experiment_file, cfg) if experiment_file is not None else None
+    )
     strategy_cache = {}
-    results = [
-        (scenario_spread, run_backtest(
-            histories,
-            cfg,
+    experiment_name = None
+
+    def run_period(period_start, period_end, *, simulation_start=None, simulation_end=None):
+        results = [
+            (scenario_spread, run_backtest(
+                histories,
+                cfg,
+                slippage_bps=slippage_bps,
+                spread_bps=scenario_spread,
+                commission_per_share=commission_per_share,
+                target_fill_mode=target_fill_mode,
+                target_trade_through_bps=target_trade_through_bps,
+                strategy_cache=strategy_cache,
+                benchmark=benchmark,
+                sector_benchmarks=sector_benchmarks,
+                simulation_start=simulation_start,
+                simulation_end=simulation_end,
+                universe_membership=(
+                    historical_universe.membership if historical_universe is not None else None
+                ),
+            ))
+            for scenario_spread in spread_scenarios
+        ]
+        run_ids = persist_sensitivity_results(
+            results,
+            symbols=list(symbols),
+            start=period_start,
+            end=period_end,
             slippage_bps=slippage_bps,
-            spread_bps=scenario_spread,
             commission_per_share=commission_per_share,
             target_fill_mode=target_fill_mode,
             target_trade_through_bps=target_trade_through_bps,
-            strategy_cache=strategy_cache,
-            benchmark=benchmark,
-            sector_benchmarks=sector_benchmarks,
-        ))
-        for scenario_spread in spread_scenarios
-    ]
-    run_ids = persist_sensitivity_results(
-        results,
-        symbols=list(histories),
-        start=start,
-        end=end,
-        slippage_bps=slippage_bps,
-        commission_per_share=commission_per_share,
-        target_fill_mode=target_fill_mode,
-        target_trade_through_bps=target_trade_through_bps,
-    )
-    report = format_spread_sensitivity_report(
-        results,
-        run_ids=run_ids,
-        database_path=str(DEFAULT_BACKTEST_DB),
-        symbols=list(histories),
-        start=start,
-        end=end,
-        slippage_bps=slippage_bps,
-        commission_per_share=commission_per_share,
-        target_fill_mode=target_fill_mode,
-        target_trade_through_bps=target_trade_through_bps,
-    )
+            universe_source=historical_universe.source_path if historical_universe else None,
+            universe_sha256=historical_universe.sha256 if historical_universe else None,
+            universe_membership_json=historical_universe.to_json() if historical_universe else "{}",
+            universe_record_count=historical_universe.record_count if historical_universe else 0,
+            experiment_name=experiment_name,
+        )
+        report = format_spread_sensitivity_report(
+            results,
+            run_ids=run_ids,
+            database_path=str(DEFAULT_BACKTEST_DB),
+            symbols=list(symbols),
+            start=period_start,
+            end=period_end,
+            slippage_bps=slippage_bps,
+            commission_per_share=commission_per_share,
+            target_fill_mode=target_fill_mode,
+            target_trade_through_bps=target_trade_through_bps,
+            monte_carlo_simulations=monte_carlo_simulations,
+            monte_carlo_drawdown_threshold=monte_carlo_drawdown_threshold,
+            universe_source=historical_universe.source_path if historical_universe else None,
+            universe_sha256=historical_universe.sha256 if historical_universe else None,
+            universe_record_count=historical_universe.record_count if historical_universe else 0,
+            experiment_name=experiment_name,
+        )
+        return results, report, run_ids
+
+    if config_experiments is not None:
+        experiment_sections = []
+        all_run_ids = []
+        results = []
+        for experiment_name, experiment_config in config_experiments:
+            cfg = experiment_config
+            experiment_results, experiment_report, experiment_run_ids = run_period(start, end)
+            results = experiment_results
+            all_run_ids.extend(experiment_run_ids)
+            experiment_sections.extend([
+                f"## Experiment: {experiment_name}",
+                "",
+                experiment_report.replace(
+                    "# Swing Trader Execution-Cost Sensitivity",
+                    "### Execution-Cost Sensitivity",
+                    1,
+                ),
+                "",
+            ])
+        report = "\n".join([
+            "# Strategy Configuration Experiments",
+            "",
+            f"Period: {start} to {end}",
+            f"Experiments: {len(config_experiments)}",
+            "All variants use identical downloaded bars, universe, execution assumptions, and date range. "
+            "No parameters are selected automatically.",
+            "Run experiments only on development data; this option cannot be combined with holdout or walk-forward evaluation.",
+            "",
+            *experiment_sections,
+        ])
+        run_ids = all_run_ids
+    elif holdout_start is None:
+        results, report, run_ids = run_period(start, end)
+    elif walk_forward_months is None:
+        training_end = (date.fromisoformat(holdout_start) - timedelta(days=1)).isoformat()
+        _, training_report, training_run_ids = run_period(
+            start, training_end, simulation_end=training_end,
+        )
+        holdout_results, holdout_report, holdout_run_ids = run_period(
+            holdout_start, end, simulation_start=holdout_start,
+        )
+        report = "\n".join([
+            "# Out-of-Sample Holdout Validation",
+            "",
+            f"Data downloaded: {start} to {end}",
+            f"In-sample period: {start} to {training_end}",
+            f"Untouched holdout period: {holdout_start} to {end}",
+            "The holdout period uses the same strategy and configuration; no tuning is performed by this command.",
+            "",
+            "## In-sample results",
+            "",
+            training_report.replace("# Swing Trader Execution-Cost Sensitivity", "### Execution-Cost Sensitivity", 1),
+            "",
+            "## Out-of-sample holdout results",
+            "",
+            holdout_report.replace("# Swing Trader Execution-Cost Sensitivity", "### Execution-Cost Sensitivity", 1),
+        ])
+        results = holdout_results
+        run_ids = training_run_ids + holdout_run_ids
+    else:
+        training_end = (date.fromisoformat(holdout_start) - timedelta(days=1)).isoformat()
+        _, training_report, all_run_ids = run_period(
+            start, training_end, simulation_end=training_end,
+        )
+        windows = build_walk_forward_windows(holdout_start, end, walk_forward_months)
+        window_sections = []
+        for window_start, window_end in windows:
+            results, window_report, window_run_ids = run_period(
+                window_start,
+                window_end,
+                simulation_start=window_start,
+                simulation_end=window_end,
+            )
+            all_run_ids.extend(window_run_ids)
+            window_sections.extend([
+                f"## Out-of-sample window {window_start} to {window_end}",
+                "",
+                window_report.replace(
+                    "# Swing Trader Execution-Cost Sensitivity",
+                    "### Execution-Cost Sensitivity",
+                    1,
+                ),
+                "",
+            ])
+        report = "\n".join([
+            "# Walk-Forward Out-of-Sample Validation",
+            "",
+            f"Data downloaded: {start} to {end}",
+            f"Initial development period: {start} to {training_end}",
+            f"Out-of-sample windows: {len(windows)} consecutive windows of up to {walk_forward_months} month(s)",
+            "The same strategy and configuration are evaluated independently in each window; no parameter tuning is performed by this command.",
+            "",
+            "## Initial development-period results",
+            "",
+            training_report.replace(
+                "# Swing Trader Execution-Cost Sensitivity",
+                "### Execution-Cost Sensitivity",
+                1,
+            ),
+            "",
+            *window_sections,
+        ])
+        run_ids = all_run_ids
+    report = f"{format_data_coverage_report(coverage)}\n{report}"
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
     report_path = REPORT_DIR / f"backtest_{timestamp}.md"
     report_path.write_text(report, encoding="utf-8")
@@ -322,6 +517,31 @@ def run_backtest_cli(
     print(f"Persisted {len(run_ids)} run(s) to {DEFAULT_BACKTEST_DB}")
     print(f"Saved backtest report to {report_path}")
     return results
+
+
+def run_alpaca_asset_snapshot() -> tuple[str, int]:
+    from swingtrader.asset_snapshot import fetch_and_persist_alpaca_asset_snapshot
+
+    snapshot_id, asset_count = fetch_and_persist_alpaca_asset_snapshot()
+    print(f"Saved read-only Alpaca US-equity asset snapshot: {snapshot_id} ({asset_count:,} assets)")
+    print("Asset status is observed as of retrieval time; this does not reconstruct historical membership.")
+    return snapshot_id, asset_count
+
+
+def run_backtest_history(limit: int = 20) -> str:
+    from swingtrader.backtest_store import format_backtest_history
+
+    report = format_backtest_history(limit=limit)
+    print(report, end="")
+    return report
+
+
+def run_backtest_detail(run_id: str) -> str:
+    from swingtrader.backtest_store import format_backtest_run
+
+    report = format_backtest_run(run_id)
+    print(report, end="")
+    return report
 
 
 @contextmanager
@@ -373,13 +593,56 @@ def main():
         try:
             parser = argparse.ArgumentParser(description="Consistent Swing Trading Scanner for NYSE & NASDAQ")
             parser.add_argument("--symbols", nargs="+", help="Optional specific ticker symbols to scan")
+            parser.add_argument(
+                "--universe-file",
+                help="CSV of date-effective historical membership (symbol,start_date,end_date); for backtests only",
+            )
+            parser.add_argument(
+                "--experiment-file",
+                help="JSON list of named TradingConfig overrides for a development-period comparison",
+            )
             parser.add_argument("--output", help="Path for JSON scan snapshot output")
             parser.add_argument("--top", type=int, default=25, help="Number of top candidates to return (default 25)")
             parser.add_argument("--min-price", type=float, help="Minimum stock price (default $5.00)")
             parser.add_argument("--max-price", type=float, help="Maximum stock price (default $30.00)")
             parser.add_argument("--backtest", action="store_true", help="Run a historical daily-bar backtest")
+            parser.add_argument(
+                "--backtest-history",
+                nargs="?",
+                const=20,
+                type=int,
+                metavar="LIMIT",
+                help="List recent persisted backtests (default: 20)",
+            )
+            parser.add_argument("--backtest-run", metavar="RUN_ID", help="Show a persisted backtest and its trades")
+            parser.add_argument(
+                "--snapshot-alpaca-assets",
+                action="store_true",
+                help="Save a read-only, dated snapshot of Alpaca US-equity asset status",
+            )
             parser.add_argument("--start", help="Backtest start date (YYYY-MM-DD)")
             parser.add_argument("--end", help="Backtest end date (YYYY-MM-DD)")
+            parser.add_argument(
+                "--holdout-start",
+                help="Optional untouched out-of-sample start date; runs and reports pre-holdout and holdout periods separately",
+            )
+            parser.add_argument(
+                "--walk-forward-months",
+                type=int,
+                help="Split the holdout period into consecutive out-of-sample windows of this many months",
+            )
+            parser.add_argument(
+                "--monte-carlo-simulations",
+                type=int,
+                default=1000,
+                help="Trade-sequence bootstrap paths in each report (default 1000)",
+            )
+            parser.add_argument(
+                "--monte-carlo-drawdown-threshold",
+                type=float,
+                default=-0.20,
+                help="Drawdown threshold for Monte Carlo probability (default -0.20)",
+            )
             parser.add_argument("--slippage-bps", type=float, default=5.0, help="Slippage per fill in basis points")
             parser.add_argument("--spread-bps", type=float, default=5.0, help="Full bid-ask spread in basis points")
             parser.add_argument(
@@ -415,11 +678,74 @@ def main():
             paper_modes.add_argument("--paper-bot-once", action="store_true", help="Run one guarded paper bot cycle and exit")
 
             args = parser.parse_args()
-            if args.backtest:
+            if args.backtest_history is not None or args.backtest_run:
+                if any((
+                    args.snapshot_alpaca_assets, args.backtest, args.paper_preview, args.paper_trade,
+                    args.paper_status, args.paper_reconcile, args.paper_bot, args.paper_bot_once,
+                    args.symbols, args.universe_file, args.experiment_file, args.output,
+                    args.start, args.end, args.holdout_start, args.walk_forward_months is not None,
+                    args.spread_scenarios_bps is not None, args.min_price is not None,
+                    args.max_price is not None, args.top != 25, args.slippage_bps != 5.0,
+                    args.spread_bps != 5.0, args.commission_per_share != 0.0,
+                    args.target_fill_mode != "trade_through",
+                    args.target_trade_through_bps != 5.0,
+                    args.monte_carlo_simulations != 1000,
+                    args.monte_carlo_drawdown_threshold != -0.20,
+                )):
+                    parser.error("Backtest history/detail options cannot be combined with other modes")
+                if args.backtest_history is not None:
+                    if args.backtest_run:
+                        parser.error("--backtest-history and --backtest-run are mutually exclusive")
+                    if args.backtest_history < 1:
+                        parser.error("--backtest-history limit must be at least 1")
+                    run_backtest_history(args.backtest_history)
+                else:
+                    run_backtest_detail(args.backtest_run)
+            elif args.snapshot_alpaca_assets:
+                if any((
+                    args.backtest, args.paper_preview, args.paper_trade, args.paper_status,
+                    args.paper_reconcile, args.paper_bot, args.paper_bot_once, args.symbols,
+                    args.universe_file, args.experiment_file, args.output, args.start, args.end,
+                    args.holdout_start, args.walk_forward_months is not None,
+                    args.spread_scenarios_bps is not None, args.min_price is not None,
+                    args.max_price is not None, args.top != 25, args.slippage_bps != 5.0,
+                    args.spread_bps != 5.0, args.commission_per_share != 0.0,
+                    args.target_fill_mode != "trade_through",
+                    args.target_trade_through_bps != 5.0,
+                    args.monte_carlo_simulations != 1000,
+                    args.monte_carlo_drawdown_threshold != -0.20,
+                )):
+                    parser.error("--snapshot-alpaca-assets cannot be combined with other operating modes")
+                run_alpaca_asset_snapshot()
+            elif args.backtest:
                 if not args.start or not args.end:
                     parser.error("--backtest requires both --start and --end")
+                if bool(args.symbols) == bool(args.universe_file):
+                    parser.error("--backtest requires exactly one of --symbols or --universe-file")
+                if args.experiment_file and (args.holdout_start or args.walk_forward_months is not None):
+                    parser.error("--experiment-file cannot be combined with holdout or walk-forward evaluation")
                 if date.fromisoformat(args.start) > date.fromisoformat(args.end):
                     parser.error("--start must not be later than --end")
+                if args.holdout_start:
+                    try:
+                        valid_holdout = (
+                            date.fromisoformat(args.start)
+                            < date.fromisoformat(args.holdout_start)
+                            <= date.fromisoformat(args.end)
+                        )
+                    except ValueError:
+                        parser.error("--holdout-start must use YYYY-MM-DD")
+                    if not valid_holdout:
+                        parser.error("--holdout-start must be later than --start and no later than --end")
+                if args.walk_forward_months is not None:
+                    if not args.holdout_start:
+                        parser.error("--walk-forward-months requires --holdout-start")
+                    if args.walk_forward_months < 1:
+                        parser.error("--walk-forward-months must be at least 1")
+                if args.monte_carlo_simulations < 1:
+                    parser.error("--monte-carlo-simulations must be at least 1")
+                if not -1 <= args.monte_carlo_drawdown_threshold <= 0:
+                    parser.error("--monte-carlo-drawdown-threshold must be between -1 and 0")
                 config = build_config(minimum_price=args.min_price, maximum_price=args.max_price)
                 run_backtest_cli(
                     args.symbols,
@@ -432,7 +758,15 @@ def main():
                     commission_per_share=args.commission_per_share,
                     target_fill_mode=args.target_fill_mode,
                     target_trade_through_bps=args.target_trade_through_bps,
+                    holdout_start=args.holdout_start,
+                    walk_forward_months=args.walk_forward_months,
+                    monte_carlo_simulations=args.monte_carlo_simulations,
+                    monte_carlo_drawdown_threshold=args.monte_carlo_drawdown_threshold,
+                    universe_file=args.universe_file,
+                    experiment_file=args.experiment_file,
                 )
+            elif args.universe_file or args.experiment_file:
+                parser.error("--universe-file and --experiment-file can only be used with --backtest")
             elif args.paper_status or args.paper_reconcile:
                 from swingtrader.paper_trading import report_paper_status
 

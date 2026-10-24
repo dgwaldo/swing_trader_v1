@@ -9,7 +9,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .config import TradingConfig
+from .correlations import highest_absolute_correlation, validate_correlation_config
+from .market_data import AlpacaMarketDataProvider
 from .scanner import TradeCandidate
+from .sectors import sector_for_symbol
 
 
 CREDENTIALS_PATH = Path(__file__).resolve().parent.parent / "config.py"
@@ -32,6 +35,144 @@ class BotCapacity:
     slots: int
     remaining_risk: float
     symbols: frozenset[str]
+
+
+def enforce_sector_exposure_limit(
+    symbol: str,
+    proposed_market_value: float,
+    positions,
+    open_orders,
+    cfg: TradingConfig,
+) -> None:
+    limit_fraction = cfg.max_sector_exposure_fraction
+    if not math.isfinite(limit_fraction) or not 0 < limit_fraction <= 1:
+        raise ValueError("Maximum sector exposure fraction must be greater than 0 and at most 1")
+    if not math.isfinite(proposed_market_value) or proposed_market_value <= 0:
+        raise ValueError("Proposed sector market value must be positive and finite")
+
+    target_sector = sector_for_symbol(symbol)
+    exposure = 0.0
+    for position in positions:
+        position_symbol = getattr(position, "symbol", None)
+        if not isinstance(position_symbol, str) or not position_symbol:
+            raise ValueError("Cannot verify sector exposure for a position without a symbol")
+        if sector_for_symbol(position_symbol) != target_sector:
+            continue
+        market_value = _finite_number(
+            getattr(position, "market_value", None),
+            f"{position_symbol}: market value unavailable for sector exposure check",
+        )
+        exposure += abs(market_value)
+
+    active_buy_statuses = {
+        "new", "accepted", "pending_new", "accepted_for_bidding", "partially_filled",
+        "done_for_day", "pending_cancel", "pending_replace", "held",
+    }
+    for order in open_orders:
+        side = str(getattr(getattr(order, "side", None), "value", getattr(order, "side", ""))).lower()
+        status = str(getattr(getattr(order, "status", None), "value", getattr(order, "status", ""))).lower()
+        if side != "buy" or status not in active_buy_statuses:
+            continue
+        order_symbol = getattr(order, "symbol", None)
+        if not isinstance(order_symbol, str) or not order_symbol:
+            raise ValueError("Cannot verify sector exposure for a pending order without a symbol")
+        if sector_for_symbol(order_symbol) != target_sector:
+            continue
+        quantity = _finite_number(
+            getattr(order, "qty", None),
+            f"{order_symbol}: pending buy quantity unavailable for sector exposure check",
+        )
+        filled_quantity = _finite_number(
+            getattr(order, "filled_qty", 0),
+            f"{order_symbol}: pending buy filled quantity unavailable",
+        )
+        limit_price = _finite_number(
+            getattr(order, "limit_price", None),
+            f"{order_symbol}: pending buy limit price unavailable for sector exposure check",
+        )
+        if quantity <= 0 or filled_quantity < 0 or filled_quantity > quantity or limit_price <= 0:
+            raise ValueError(f"{order_symbol}: invalid pending buy values for sector exposure check")
+        exposure += (quantity - filled_quantity) * limit_price
+
+    cap = cfg.account_size * limit_fraction
+    if exposure + proposed_market_value > cap:
+        raise ValueError(
+            f"{target_sector} sector exposure would exceed the configured "
+            f"${cap:,.2f} cap (current exposure ${exposure:,.2f})"
+        )
+
+
+def enforce_correlation_limit(
+    symbol: str,
+    peer_symbols: set[str],
+    histories,
+    cfg: TradingConfig,
+) -> None:
+    validate_correlation_config(cfg)
+    peers = sorted(peer_symbols - {symbol})
+    if not peers:
+        return
+    required_symbols = [symbol, *peers]
+    missing = [item for item in required_symbols if item not in histories or histories[item].empty]
+    if missing:
+        raise ValueError(
+            "Cannot verify correlation with open paper exposure; missing daily bars for "
+            + ", ".join(missing)
+        )
+    if any("Close" not in histories[item].columns for item in required_symbols):
+        raise ValueError("Cannot verify correlation; daily bars are missing Close prices")
+
+    correlation = highest_absolute_correlation(
+        histories[symbol]["Close"].pct_change(),
+        {
+            peer: histories[peer]["Close"].pct_change()
+            for peer in peers
+        },
+        window=cfg.correlation_lookback_sessions,
+        minimum_observations=cfg.correlation_min_observations,
+    )
+    if (
+        correlation is not None
+        and correlation[1] >= cfg.correlation_absolute_threshold
+    ):
+        raise ValueError(
+            f"{symbol} is too correlated with open {correlation[0]} exposure "
+            f"({correlation[1]:.2f} absolute correlation over "
+            f"{correlation[2]} shared sessions)"
+        )
+
+
+def fetch_correlation_histories(
+    symbols: set[str],
+    key: str,
+    secret: str,
+    cfg: TradingConfig,
+    *,
+    now: datetime | None = None,
+):
+    if not symbols:
+        return {}
+    local_now = now or datetime.now(ZoneInfo("America/New_York"))
+    if local_now.tzinfo is None:
+        raise ValueError("Correlation history end time must include a timezone")
+    end_day = local_now.astimezone(ZoneInfo("America/New_York")).date() - timedelta(days=1)
+    start_day = end_day - timedelta(days=cfg.correlation_lookback_sessions * 2 + 20)
+    provider = AlpacaMarketDataProvider(key, secret)
+    return provider.get_bars(
+        sorted(symbols),
+        start=start_day.isoformat(),
+        end=end_day.isoformat(),
+    )
+
+
+def _finite_number(value, error_message: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(error_message) from exc
+    if not math.isfinite(number):
+        raise ValueError(error_message)
+    return number
 
 
 def record_paper_fills(orders, path: Path = FILLS_PATH) -> int:
@@ -265,6 +406,7 @@ def submit_paper_candidate(candidate: TradeCandidate, cfg: TradingConfig, *, exe
     from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
     from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, StopLossRequest, TakeProfitRequest
 
+    validate_correlation_config(cfg)
     key, secret = load_paper_credentials()
 
     trading = TradingClient(key, secret, paper=True)
@@ -276,8 +418,29 @@ def submit_paper_candidate(candidate: TradeCandidate, cfg: TradingConfig, *, exe
     positions = trading.get_all_positions()
     if any(position.symbol == candidate.symbol for position in positions):
         raise ValueError(f"Already holding {candidate.symbol} in the paper account")
-    if trading.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[candidate.symbol])):
+    open_orders = trading.get_orders(
+        filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True, limit=500)
+    )
+    if len(open_orders) >= 500:
+        raise ValueError("Order history limit reached; verify open positions and orders in Alpaca")
+    if any(order.symbol == candidate.symbol for order in open_orders):
         raise ValueError(f"Open paper order already exists for {candidate.symbol}")
+    open_buy_statuses = {
+        "new", "accepted", "pending_new", "accepted_for_bidding", "partially_filled",
+        "done_for_day", "pending_cancel", "pending_replace", "held",
+    }
+    peer_symbols = {position.symbol for position in positions}
+    peer_symbols.update(
+        order.symbol
+        for order in open_orders
+        if str(getattr(getattr(order, "side", None), "value", getattr(order, "side", ""))).lower() == "buy"
+        and str(getattr(getattr(order, "status", None), "value", getattr(order, "status", ""))).lower()
+        in open_buy_statuses
+    )
+    peer_symbols.discard(candidate.symbol)
+    if peer_symbols:
+        histories = fetch_correlation_histories(peer_symbols | {candidate.symbol}, key, secret, cfg)
+        enforce_correlation_limit(candidate.symbol, peer_symbols, histories, cfg)
 
     quote = StockHistoricalDataClient(key, secret).get_stock_latest_quote(
         StockLatestQuoteRequest(symbol_or_symbols=candidate.symbol)
@@ -288,6 +451,13 @@ def submit_paper_candidate(candidate: TradeCandidate, cfg: TradingConfig, *, exe
     if age < timedelta(0) or age > timedelta(seconds=cfg.max_quote_age_seconds):
         raise ValueError("Alpaca quote is stale; no order placed")
     plan = plan_paper_order(candidate, float(quote.bid_price), float(quote.ask_price), cfg)
+    enforce_sector_exposure_limit(
+        plan.symbol,
+        plan.shares * plan.limit_price,
+        positions,
+        open_orders,
+        cfg,
+    )
 
     available_cash = min(float(account.cash), float(account.buying_power))
     if bot_mode:
