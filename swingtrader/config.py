@@ -44,7 +44,9 @@ class TradingConfig:
     correlation_lookback_sessions: int = 60
     correlation_min_observations: int = 30
     correlation_absolute_threshold: float = 0.85
-    bot_poll_seconds: int = 300
+    bot_auto_recover: bool = True
+    bot_max_hold_days: int = 180
+    bot_poll_seconds: int = 30
     bot_scan_interval_seconds: int = 900
 
 

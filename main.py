@@ -1,12 +1,14 @@
 import argparse
 import importlib.util
 import json
+import logging
 import math
 import sys
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from logging.handlers import RotatingFileHandler
 from time import perf_counter, sleep
 from zoneinfo import ZoneInfo
 
@@ -164,29 +166,37 @@ def run_scanner(symbols=None, output_path=None, top=25, cfg=None):
 
 def run_paper_bot_cycle(cfg, symbols=None, top=25, *, scan=run_scanner, now=None):
     from swingtrader.paper_trading import (
-        bot_attempted_today, bot_capacity, check_bot_daily_halt, paper_bot_snapshot, record_paper_fills,
+        bot_attempted_today, bot_capacity, check_bot_daily_halt, paper_bot_snapshot,
         review_paper_orders,
         submit_paper_candidate,
     )
+    from swingtrader.paper_journal import add_event, synchronize_journal
+    from swingtrader.paper_recovery import reconcile_paper_risk
 
     now = now or datetime.now(timezone.utc)
     trading, orders = paper_bot_snapshot()
-    new_fills = record_paper_fills(orders)
-    if new_fills:
-        print(f"Recorded {new_fills} paper fills in the local ledger")
-    messages = review_paper_orders(trading, orders, now, cancel_stale=True)
-    for message in messages:
-        print(message)
-    if any("manual review" in message or "cancellation requested" in message for message in messages):
-        print("Paper bot paused: verify orders before any new entries")
-        return False
     account = trading.get_account()
     positions = trading.get_all_positions()
+    new_fills = synchronize_journal(account, positions, orders, now)
+    if new_fills:
+        print(f"Recorded {new_fills} new or updated paper fills in the local ledger")
+    if cfg.bot_auto_recover:
+        if not reconcile_paper_risk(trading, positions, orders, now, cfg):
+            print("Paper bot recovering broker state; no new entries this cycle")
+            return False
+    else:
+        messages = review_paper_orders(trading, orders, now, cancel_stale=True)
+        for message in messages:
+            print(message)
+        if any("manual review" in message or "cancellation requested" in message for message in messages):
+            print("Paper bot paused: verify orders before any new entries")
+            return False
     try:
         check_bot_daily_halt(account, cfg, now)
         capacity = bot_capacity(account, positions, orders, cfg, now)
     except ValueError as exc:
         print(f"Paper bot paused: {exc}")
+        add_event("WARNING", str(exc))
         return False
     if scan is None:
         return False
@@ -211,6 +221,8 @@ def run_paper_bot_cycle(cfg, symbols=None, top=25, *, scan=run_scanner, now=None
 
 
 def run_paper_bot(cfg, symbols=None, top=25, *, once=False):
+    from swingtrader.paper_journal import FILLS_PATH, add_event
+
     if importlib.util.find_spec("alpaca") is None:
         raise RuntimeError(
             f"alpaca-py is not installed in {sys.executable}; run the bot with .\\.venv\\Scripts\\python.exe"
@@ -219,6 +231,15 @@ def run_paper_bot(cfg, symbols=None, top=25, *, once=False):
         raise ValueError("Paper bot polling interval must be at least 30 seconds")
     if cfg.bot_scan_interval_seconds < cfg.bot_poll_seconds:
         raise ValueError("Paper bot scan interval must be at least the polling interval")
+    if not isinstance(cfg.bot_auto_recover, bool) or not isinstance(cfg.bot_max_hold_days, int) or cfg.bot_max_hold_days < 1:
+        raise ValueError("Invalid paper bot automatic recovery or maximum holding period")
+    logger = logging.getLogger("swingtrader.paper_bot")
+    if not logger.handlers:
+        FILLS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(FILLS_PATH.with_name("paper_bot.log"), maxBytes=2_000_000, backupCount=5)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
     last_scan_at = None
     while True:
         now = perf_counter()
@@ -226,8 +247,11 @@ def run_paper_bot(cfg, symbols=None, top=25, *, once=False):
             scan = run_scanner if last_scan_at is None or now - last_scan_at >= cfg.bot_scan_interval_seconds else None
             if run_paper_bot_cycle(cfg, symbols, top, scan=scan):
                 last_scan_at = perf_counter()
+            logger.info("Paper bot cycle complete")
         except Exception as exc:
             print(f"Paper bot paused this cycle: {exc}")
+            logger.exception("Paper bot cycle failed; no further entries this cycle")
+            add_event("ERROR", str(exc))
             if once:
                 raise
         print(f"Paper bot cycle complete at {datetime.now():%Y-%m-%d %H:%M:%S}", flush=True)
@@ -606,6 +630,7 @@ def main():
             parser.add_argument("--min-price", type=float, help="Minimum stock price (default $5.00)")
             parser.add_argument("--max-price", type=float, help="Maximum stock price (default $30.00)")
             parser.add_argument("--backtest", action="store_true", help="Run a historical daily-bar backtest")
+            parser.add_argument("--research", action="store_true", help="Run the research scanner and ranked grid; never submit orders (default mode)")
             parser.add_argument(
                 "--backtest-history",
                 nargs="?",
@@ -673,15 +698,31 @@ def main():
             paper_modes.add_argument("--paper-preview", action="store_true", help="Check top candidate against Alpaca paper quotes without placing an order")
             paper_modes.add_argument("--paper-trade", action="store_true", help="Submit one Alpaca paper bracket order for the top candidate")
             paper_modes.add_argument("--paper-status", action="store_true", help="Inspect Alpaca paper positions and orders without changing them")
+            paper_modes.add_argument("--paper-performance", action="store_true", help="Read the local paper journal and performance report; no broker access")
             paper_modes.add_argument("--paper-reconcile", action="store_true", help="Inspect paper orders and request cancellation of stale unfilled bot entries")
             paper_modes.add_argument("--paper-bot", action="store_true", help="Reconcile continuously and rescan for open paper slots")
             paper_modes.add_argument("--paper-bot-once", action="store_true", help="Run one guarded paper bot cycle and exit")
 
             args = parser.parse_args()
+            paper_mode = any((
+                args.paper_preview, args.paper_trade, args.paper_status, args.paper_performance,
+                args.paper_reconcile, args.paper_bot, args.paper_bot_once,
+            ))
+            if args.research and any((paper_mode, args.backtest, args.backtest_history is not None,
+                                      args.backtest_run, args.snapshot_alpaca_assets)):
+                parser.error("--research cannot be combined with a trading or historical mode")
+            if args.backtest and paper_mode:
+                parser.error("--backtest cannot be combined with a paper mode")
+            if args.paper_performance and any((
+                args.symbols, args.output, args.universe_file, args.experiment_file,
+                args.start, args.end, args.holdout_start, args.walk_forward_months is not None,
+                args.min_price is not None, args.max_price is not None,
+            )):
+                parser.error("--paper-performance reads the local journal only; scan/backtest options are not supported")
             if args.backtest_history is not None or args.backtest_run:
                 if any((
                     args.snapshot_alpaca_assets, args.backtest, args.paper_preview, args.paper_trade,
-                    args.paper_status, args.paper_reconcile, args.paper_bot, args.paper_bot_once,
+                    args.paper_status, args.paper_performance, args.paper_reconcile, args.paper_bot, args.paper_bot_once,
                     args.symbols, args.universe_file, args.experiment_file, args.output,
                     args.start, args.end, args.holdout_start, args.walk_forward_months is not None,
                     args.spread_scenarios_bps is not None, args.min_price is not None,
@@ -703,7 +744,7 @@ def main():
                     run_backtest_detail(args.backtest_run)
             elif args.snapshot_alpaca_assets:
                 if any((
-                    args.backtest, args.paper_preview, args.paper_trade, args.paper_status,
+                    args.backtest, args.paper_preview, args.paper_trade, args.paper_status, args.paper_performance,
                     args.paper_reconcile, args.paper_bot, args.paper_bot_once, args.symbols,
                     args.universe_file, args.experiment_file, args.output, args.start, args.end,
                     args.holdout_start, args.walk_forward_months is not None,
@@ -767,6 +808,10 @@ def main():
                 )
             elif args.universe_file or args.experiment_file:
                 parser.error("--universe-file and --experiment-file can only be used with --backtest")
+            elif args.paper_performance:
+                from swingtrader.paper_journal import format_paper_performance
+
+                print(format_paper_performance(), end="")
             elif args.paper_status or args.paper_reconcile:
                 from swingtrader.paper_trading import report_paper_status
 

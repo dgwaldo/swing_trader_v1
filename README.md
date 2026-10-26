@@ -1,6 +1,21 @@
 # Swing Trader
 
-A rules-based swing-trading scanner for liquid NYSE and NASDAQ stocks priced between $5 and $30.
+A rules-based swing-trading research scanner and paper-trading bot for liquid
+NYSE and NASDAQ stocks priced between $5 and $30.
+
+## Two operating purposes
+
+- **Research:** `python main.py --research` (or simply `python main.py`) produces
+  the ranked candidate grid, JSON snapshot, and Markdown report. Research does
+  not submit, cancel, or repair orders and needs no Alpaca credentials.
+  Historical backtesting remains a separate research tool.
+- **Paper bot:** `.\.venv\Scripts\python.exe main.py --paper-bot` scans candidates,
+  places paper orders, reconciles broker state, manages recovery, and records
+  forward observations. It uses the configured strategy, not backtest results,
+  to decide entries. Live-money execution is not supported.
+
+Research and paper operation flags cannot be combined. The research grid remains
+available independently of the bot.
 
 ## What it does
 
@@ -50,7 +65,7 @@ missing exit legs require manual review in Alpaca. Validate a real paper fill an
 Alpaca dashboard before relying on `--paper-trade`; neither tests nor a preview
 prove broker execution, and stops cannot guarantee the planned loss.
 
-## Paper Bot (Experimental)
+## Paper Bot (Supervised rollout before unattended use)
 
 After verifying the one-shot paper workflow in Alpaca, start the paper-only bot
 from the project directory on Windows with
@@ -62,10 +77,11 @@ and exits (it **can place paper orders**). Both modes require paper credentials.
 Only one bot instance can run at a time. Outside regular US market hours the bot
 reconciles broker state but does not place entries. Between 10:00 and 15:30 New
 York time, it scans every 15 minutes while a position slot and planned-risk
-budget remain available, and checks broker state every five minutes by default.
+budget remain available, and checks broker state every thirty seconds by default.
 It skips any symbol already attempted by the paper bot that trading day, even
 if its entry was canceled or its position has closed. A scan does not guarantee
-that a candidate or an order fill will be available.
+that a candidate or an order fill will be available. Broker polling defaults to
+30 seconds; a previously configured `bot_poll_seconds` overrides this.
 
 Before every entry, the bot fetches fresh Alpaca quotes, positions and orders.
 It enforces a five-position limit (including pending entries), 2% daily loss
@@ -79,14 +95,91 @@ positions when the daily limit is reached. With $1,000 sizing, the default
 per-trade risk is $10, daily pause is $20, and combined planned downside is
 at most $100. Stops can slip beyond those planned limits.
 
-The bot stores broker-reported fills, including buys and sells, idempotently
-in `data/paper_fills.sqlite3`. This is a gross fill ledger, not a fee-adjusted
-net-return report. Unknown positions, partial fills, missing exit legs, pending
-cancellations, order-history overflow and approaching GTC expiry stop new buys;
-check Alpaca and repair those situations manually. The bot does **not** yet
-renew a bracket before Alpaca's 90-day GTC cancellation or automatically close
-a position at 180 days. Do not leave it unmonitored for long holds or treat this
-as proof of a profitable strategy.
+The bot stores broker-reported cumulative fills, including partial buys and
+sells, idempotently in `data/paper_fills.sqlite3`. Increasing filled quantities
+update the same order rather than double-counting it. Existing fill databases
+are retained and extended automatically. The database also stores new entry
+plans with strategy/configuration/rationale, recovery requests, account equity
+observations, the last successful synchronization, and operational events.
+The journal binds to the first synchronized account and refuses a different
+account afterward. Legacy records cannot retroactively establish account
+identity or recover missing entry rationale.
+
+With `bot_auto_recover=True` (default), the paper bot:
+
+- Cancels stale unfilled entries and the unfilled remainder of partial entries.
+- Verifies bot ownership and quantities before changing exits. Unknown positions,
+  mixed/unmatched quantities, and unrelated working orders block automatic
+  recovery and new entries; they are never automatically liquidated.
+- Repairs missing/invalid protection using an OCO sell order at the original
+  stop and target, without recalculating the strategy's target.
+- Renews protection five days before a reported expiry, or after 80 days when
+  the broker supplies no expiry. Cancellation must be observed before replacement.
+- Closes verified bot exposure during regular market hours if original protection
+  cannot be reconstructed, a repair is rejected, or the position reaches
+  `bot_max_hold_days` (180 by default). It does not cancel a working emergency close.
+- Cancels orphaned bot exits after confirmed flat positions and balanced fills.
+- Uses persisted recovery client IDs to reconcile uncertain acknowledgements
+  across restarts instead of submitting a new independent sell.
+
+Recovery blocks all new entries until a later broker snapshot confirms safe
+state. Broker/API failures, quantity disagreements, pending cancellations, and
+unpageable equal-timestamp order boundaries fail closed. Order history is
+paginated, rather than stopping at 500 orders. Recovery is not atomic: cancellation
+and replacement can leave a protection gap, and market exits can slip. Outside
+regular hours the bot defers protective-order replacement/market liquidation;
+stale entry cancellations can still be requested. An outage or closed market
+can prevent recovery. Prefer a dedicated paper account without manual trades.
+
+Set `bot_auto_recover=False` to retain manual-review behavior. The one-shot
+`--paper-trade` command does not run the ongoing recovery loop; use the bot for
+continuous management. Both entry paths reserve a local daily attempt before
+submission, so an uncertain buy acknowledgement is not retried that day.
+
+Inspect forward results without credentials or broker access:
+
+```powershell
+.\.venv\Scripts\python.exe main.py --paper-performance
+```
+
+The report includes remaining quantities, realized gross P&L/returns, closed-trade
+holding days and exit types where known, win rate, average win/loss, expectancy,
+profit factor, last synchronization, recent events, and last-observed open
+positions. It also reports account-wide equity and sampled drawdown, explicitly
+separate from bot-only trade P&L. Fees, deposits/withdrawals, and intracycle equity
+moves are not reconstructed; these are not fee-adjusted or time-weighted returns.
+Partial-fill holding timestamps can be cumulative observation times. A local
+report is not a fresh broker query or proof of profitability.
+
+Operational exceptions and cycle heartbeats go to rotating `data/paper_bot.log`
+files; recovery events are also queryable through the performance report.
+These are local alerts, not email/push notifications. Errors retry on subsequent
+cycles, but ambiguous states deliberately remain paused rather than guessing.
+Regularly check health during initial rollout; tests do not establish actual
+broker execution.
+
+### Optional Windows startup and process restart
+
+After a monitored paper entry/exit and recovery check, register an opt-in Windows
+Scheduled Task from PowerShell:
+
+```powershell
+.\scripts\Register-PaperBot.ps1
+```
+
+The script registers, but does not start, a task under the current logged-on user.
+It uses the repository's virtual environment and working directory, starts at
+future logons, prevents overlapping task instances, and requests process restarts
+after failures. Existing tasks are not overwritten. Start paper trading explicitly:
+
+```powershell
+Start-ScheduledTask -TaskName SwingTraderPaperBot
+```
+
+The PC must remain powered on, awake, connected, and logged in. No service,
+remote health monitor, or automatic wake configuration is installed.
+`Disable-ScheduledTask` prevents future starts; `Stop-ScheduledTask` stops the
+process but does not cancel broker-held orders or liquidate positions.
 
 Paper orders use the configured `target_percent` (1% by default) plus an
 `estimated_exit_cost_fraction` allowance (0.1% by default), calculated against
@@ -95,7 +188,7 @@ limit is 0.2% of midpoint. These are conservative planning assumptions, not
 measured trading costs or a guarantee of 1% realized net profit; calculate
 actual net results from broker fills and fees. Alpaca's GTC orders are subject
 to an aged-order cancellation policy after 90 days, so this workflow cannot
-leave a 180-day position unattended without checking and renewing its exits.
+leave a 180-day position unattended without a functioning renewal/recovery loop.
 
 ## Run scanner
 

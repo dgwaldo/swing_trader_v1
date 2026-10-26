@@ -1340,6 +1340,30 @@ Only after successful paper validation:
 
 ---
 
+## Progress Update (2026-10-24): Two purposes and paper automation
+
+- Research remains a standalone ranked-grid scanner (`--research`, also the
+  default mode); it never executes paper orders. Backtest research is retained.
+- The paper bot now synchronizes cumulative partial/full fills with paginated
+  broker order history, preserves new entry plans/configurations, records
+  account observations and operational events, and exposes a local read-only
+  `--paper-performance` report. Legacy fills remain readable.
+- Automatic paper recovery cancels stale/partial entries, verifies quantities,
+  restores original stop/target protection, renews aging exits, and closes
+  verified bot positions when protection cannot be reconstructed/repaired or
+  the configured maximum holding period is reached. Unknown/mixed ownership
+  fails closed rather than liquidating unrelated positions.
+- Recovery requests are persisted before submission and reconciled by client
+  ID across restarts. New buys are paused during uncertain broker state.
+- Added rotating local operational logs and an optional Windows logon task
+  registration script; no task is installed or started automatically.
+- This is implementation progress, not broker validation or evidence of trading
+  success. Actual paper fills/recovery still require a monitored rollout.
+  Fees, external notifications, always-on hosting, and cash-flow-adjusted
+  performance are not implemented. The configured profit target is unchanged.
+
+---
+
 # 32. Definition of "Good Enough"
 
 The bot should not be considered successful because it has:

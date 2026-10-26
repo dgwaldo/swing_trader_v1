@@ -31,6 +31,8 @@ TRADING_CONFIG = TradingConfig(
 	correlation_lookback_sessions=60,     # Correlated-entry guard: daily return lookback.
 	correlation_min_observations=30,      # Correlated-entry guard: minimum shared returns.
 	correlation_absolute_threshold=0.85,  # Correlated-entry guard: block at/above absolute correlation.
-	bot_poll_seconds=300,                 # Bot: reconcile broker orders every five minutes.
+	bot_auto_recover=True,                # Paper bot: repair exits or close verified bot positions.
+	bot_max_hold_days=180,                # Paper bot: close positions at this age during regular hours.
+	bot_poll_seconds=30,                  # Bot: reconcile broker state every thirty seconds.
 	bot_scan_interval_seconds=900,        # Bot: rescan open slots every fifteen minutes.
 )

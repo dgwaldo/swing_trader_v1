@@ -180,7 +180,8 @@ class PaperTradingTests(unittest.TestCase):
         trading.get_orders.return_value = []
         trading.get_account.return_value = account
         trading.get_all_positions.return_value = []
-        with patch("swingtrader.paper_trading.record_paper_fills", return_value=0), \
+        with patch("swingtrader.paper_journal.synchronize_journal", return_value=0), \
+            patch("swingtrader.paper_recovery.reconcile_paper_risk", return_value=True), \
             patch("swingtrader.paper_trading.paper_bot_snapshot", return_value=(trading, [])), \
             patch("swingtrader.paper_trading.check_bot_daily_halt"), \
                 redirect_stdout(io.StringIO()):
@@ -226,7 +227,8 @@ class PaperTradingTests(unittest.TestCase):
         trading.get_clock.return_value.is_open = True
         candidates = [SimpleNamespace(symbol="TEST"), SimpleNamespace(symbol="NEXT")]
         with patch("swingtrader.paper_trading.paper_bot_snapshot", return_value=(trading, [order])), \
-                patch("swingtrader.paper_trading.record_paper_fills", return_value=0), \
+                patch("swingtrader.paper_recovery.reconcile_paper_risk", return_value=True), \
+                patch("swingtrader.paper_journal.synchronize_journal", return_value=0), \
                 patch("swingtrader.paper_trading.check_bot_daily_halt"), \
                 patch("swingtrader.paper_trading.submit_paper_candidate", return_value=SimpleNamespace(
                     symbol="NEXT", shares=1, limit_price=10.0, stop_price=9.0, target_price=10.12)) as submit, \
@@ -253,24 +255,30 @@ class PaperTradingTests(unittest.TestCase):
         now = datetime(2026, 9, 28, 15, 0, tzinfo=timezone.utc)
         account = SimpleNamespace(equity="1000", last_equity="1000")
         position = SimpleNamespace(symbol="TEST", qty="10", avg_entry_price="10")
-        stop = SimpleNamespace(type="stop", status="new", qty="10", stop_price="9")
-        target = SimpleNamespace(type="limit", status="new")
-        entry = SimpleNamespace(symbol="TEST", client_order_id="swing-paper-TEST-1", status="filled",
+        stop = SimpleNamespace(id="stop", side="sell", order_class="simple", legs=None,
+                               type="stop", status="new", qty="10", filled_qty="0",
+                               stop_price="9", created_at=now - timedelta(days=1))
+        target = SimpleNamespace(id="target", side="sell", order_class="simple", legs=None,
+                                 type="limit", status="new", qty="10", filled_qty="0",
+                                 limit_price="11", created_at=now - timedelta(days=1))
+        entry = SimpleNamespace(id="entry", symbol="TEST", client_order_id="swing-paper-TEST-1",
+                                status="filled", order_class="bracket", type="limit",
                                 filled_at=now - timedelta(days=1), legs=[stop, target], side="buy")
-        capacity = bot_capacity(account, [position], [entry], TradingConfig(), now)
-        self.assertEqual(capacity.slots, 4)
-        self.assertEqual(capacity.remaining_risk, 90.0)
-        stop.status = "held"
-        self.assertEqual(bot_capacity(account, [position], [entry], TradingConfig(), now).remaining_risk, 90.0)
-        with self.assertRaisesRegex(ValueError, "Daily paper loss"):
-            bot_capacity(SimpleNamespace(equity="980", last_equity="1000"), [position], [entry], TradingConfig(), now)
-        stop.status = "canceled"
-        with self.assertRaisesRegex(ValueError, "exits unverified"):
-            bot_capacity(account, [position], [entry], TradingConfig(), now)
-        stop.status = "new"
-        entry.filled_at = now - timedelta(days=85)
-        with self.assertRaisesRegex(ValueError, "GTC expiry"):
-            bot_capacity(account, [position], [entry], TradingConfig(), now)
+        with patch("swingtrader.paper_trading.position_context", return_value=(entry, [entry, stop, target])):
+            capacity = bot_capacity(account, [position], [entry], TradingConfig(), now)
+            self.assertEqual(capacity.slots, 4)
+            self.assertEqual(capacity.remaining_risk, 90.0)
+            stop.status = "held"
+            self.assertEqual(bot_capacity(account, [position], [entry], TradingConfig(), now).remaining_risk, 90.0)
+            with self.assertRaisesRegex(ValueError, "Daily paper loss"):
+                bot_capacity(SimpleNamespace(equity="980", last_equity="1000"), [position], [entry], TradingConfig(), now)
+            stop.status = "canceled"
+            with self.assertRaisesRegex(ValueError, "exits unverified"):
+                bot_capacity(account, [position], [entry], TradingConfig(), now)
+            stop.status = "new"
+            stop.created_at = now - timedelta(days=85)
+            with self.assertRaisesRegex(ValueError, "exits unverified"):
+                bot_capacity(account, [position], [entry], TradingConfig(), now)
 
     def test_bot_capacity_rejects_pending_cancel_and_full_book(self):
         now = datetime(2026, 9, 28, 15, 0, tzinfo=timezone.utc)
@@ -302,7 +310,8 @@ class PaperTradingTests(unittest.TestCase):
         trading.get_clock.return_value.is_open = True
         scan = Mock(return_value=[candidate])
         with patch("swingtrader.paper_trading.paper_bot_snapshot", return_value=(trading, [])), \
-                patch("swingtrader.paper_trading.record_paper_fills", return_value=0), \
+                patch("swingtrader.paper_recovery.reconcile_paper_risk", return_value=True), \
+                patch("swingtrader.paper_journal.synchronize_journal", return_value=0), \
             patch("swingtrader.paper_trading.check_bot_daily_halt"), \
                 patch("swingtrader.paper_trading.submit_paper_candidate", return_value=SimpleNamespace(
                     symbol="TEST", shares=1, limit_price=10.0, stop_price=9.0, target_price=10.11)) as submit, \
@@ -348,7 +357,7 @@ class PaperTradingTests(unittest.TestCase):
             equity="1000", last_equity="1000", cash="1000", buying_power="1000", trading_blocked=False,
         )
         trading.get_all_positions.return_value = []
-        order = SimpleNamespace(symbol="TEST", client_order_id="swing-paper-TEST-1",
+        order = SimpleNamespace(id="old", symbol="TEST", client_order_id="swing-paper-TEST-1",
                                 created_at=datetime.now(timezone.utc), status="canceled")
         trading.get_orders.side_effect = [[], [order]]
         quote = SimpleNamespace(timestamp=datetime.now(timezone.utc), bid_price=9.99, ask_price=10.0)
